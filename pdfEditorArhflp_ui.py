@@ -16,7 +16,7 @@ from PySide6.QtGui import (QBrush, QColor, QConicalGradient, QCursor,
     QImage, QKeySequence, QLinearGradient, QPainter,
     QPalette, QPixmap, QRadialGradient, QTransform)
 from PySide6.QtWidgets import (QApplication, QGraphicsView, QGridLayout, QHBoxLayout,
-    QMainWindow, QPushButton, QSizePolicy, QSpacerItem,
+    QLabel, QMainWindow, QPushButton, QSizePolicy, QSpacerItem,
     QSpinBox, QStatusBar, QVBoxLayout, QWidget)
 
 class Ui_MainWindow(object):
@@ -37,6 +37,11 @@ class Ui_MainWindow(object):
 
         self.horizontalLayout.addWidget(self.btnCircle)
 
+        self.btnRectangle = QPushButton(self.toolBar)
+        self.btnRectangle.setObjectName(u"btnRectangle")
+
+        self.horizontalLayout.addWidget(self.btnRectangle)
+
         self.btnArrow = QPushButton(self.toolBar)
         self.btnArrow.setObjectName(u"btnArrow")
 
@@ -51,6 +56,16 @@ class Ui_MainWindow(object):
         self.spinBoxTextSize.setObjectName(u"spinBoxTextSize")
 
         self.horizontalLayout.addWidget(self.spinBoxTextSize)
+
+        self.lblPageNo = QLabel(self.toolBar)
+        self.lblPageNo.setObjectName(u"lblPageNo")
+
+        self.horizontalLayout.addWidget(self.lblPageNo)
+
+        self.spinBoxPageNo = QSpinBox(self.toolBar)
+        self.spinBoxPageNo.setObjectName(u"spinBoxPageNo")
+
+        self.horizontalLayout.addWidget(self.spinBoxPageNo)
 
         self.horizontalSpacer = QSpacerItem(1125, 20, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
 
@@ -113,8 +128,10 @@ class Ui_MainWindow(object):
     def retranslateUi(self, MainWindow):
         MainWindow.setWindowTitle(QCoreApplication.translate("MainWindow", u"MainWindow", None))
         self.btnCircle.setText(QCoreApplication.translate("MainWindow", u"Circle", None))
+        self.btnRectangle.setText(QCoreApplication.translate("MainWindow", u"Rectangle", None))
         self.btnArrow.setText(QCoreApplication.translate("MainWindow", u"Arrow", None))
         self.btnText.setText(QCoreApplication.translate("MainWindow", u"Text", None))
+        self.lblPageNo.setText(QCoreApplication.translate("MainWindow", u"Page", None))
         self.btnCorrection.setText(QCoreApplication.translate("MainWindow", u"Correction", None))
         self.btnAppr.setText(QCoreApplication.translate("MainWindow", u"Approve", None))
         self.btnCancel.setText(QCoreApplication.translate("MainWindow", u"Cancel", None))

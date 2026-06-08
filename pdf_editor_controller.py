@@ -1,8 +1,9 @@
 """
-Crash-safe PySide6 PDF correction editor for engineering drawings.
+PDF correction editor built on a Qt Designer UI.
 
-This controller uses your generated Qt Designer class `Ui_MainWindow` and
-expects the generated file `pdfEditorArhflp_ui.py` to be beside this file.
+Expected files in the same folder:
+    pdf_editor_controller.py
+    pdfEditorArhflp_ui.py
 
 Install:
     pip install PySide6 PyMuPDF
@@ -10,21 +11,9 @@ Install:
 Run:
     python pdf_editor_controller.py input.pdf output_folder_or_output.pdf
 
-Use from another PySide6 app:
-    from pdf_editor_controller import PdfCorrectionEditor
-
-    editor = PdfCorrectionEditor(
-        input_path=r"C:\\drawings\\input.pdf",
-        output_path=r"C:\\drawings\\out",  # folder or .pdf file path
-    )
+Use from your app:
+    editor = PdfCorrectionEditor(input_path="drawing.pdf", output_path="out")
     editor.show()
-
-Notes:
-    * The on-screen PDF is rendered in visible tiles/clips, not as one huge
-      full-page 300 DPI pixmap. This avoids the Windows native crash
-      0xC0000409 that can happen with large engineering sheets.
-    * Saved annotations are written as vector PDF operations. The original PDF
-      page is not rasterized when Correction is saved.
 """
 
 from __future__ import annotations
@@ -52,36 +41,40 @@ from PySide6.QtGui import (
     QPainter,
     QPainterPath,
     QPen,
+    QPixmap,
     QTransform,
 )
 from PySide6.QtWidgets import (
     QApplication,
-    QFrame,
     QGraphicsEllipseItem,
     QGraphicsItem,
     QGraphicsPathItem,
+    QGraphicsPixmapItem,
+    QGraphicsRectItem,
     QGraphicsScene,
     QGraphicsTextItem,
     QGraphicsView,
+    QFrame,
     QInputDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
-    QStyleOptionGraphicsItem,
     QWidget,
 )
 
-from ui_pdfEditor import Ui_MainWindow
+from pdfEditorArhflp_ui import Ui_MainWindow
 
 
-# QGraphicsItem data roles.
+# QGraphicsItem custom data roles.
 ITEM_KIND_ROLE = 1001
 ANNOTATION_ID_ROLE = 1002
 FONT_SIZE_PT_ROLE = 1003
 PEN_WIDTH_PT_ROLE = 1004
 
-KIND_PAGE = "page"
-KIND_CIRCLE = "circle"
+KIND_PAGE_BACKGROUND = "page_background"
+KIND_PAGE_TILE = "page_tile"
+KIND_CIRCLE = "circle"       # UI button name retained; drawn as oval/ellipse by drag.
+KIND_RECTANGLE = "rectangle"
 KIND_ARROW = "arrow"
 KIND_TEXT = "text"
 
@@ -113,7 +106,7 @@ PAPER_SIZES_MM: Dict[str, Tuple[float, float]] = {
 
 
 class ArrowGraphicsItem(QGraphicsPathItem):
-    """Movable/selectable arrow item stored in scene/PDF point units."""
+    """Selectable and movable arrow drawn as a QPainterPath in PDF points."""
 
     def __init__(
         self,
@@ -151,10 +144,11 @@ class ArrowGraphicsItem(QGraphicsPathItem):
         dx = self._end.x() - self._start.x()
         dy = self._end.y() - self._start.y()
         length = math.hypot(dx, dy)
-        if length > 0.001:
+        if length > 0.01:
             angle = math.atan2(dy, dx)
             arrow_angle = math.radians(28.0)
-            head_len = min(self._head_length_pt, max(5.0, length * 0.45))
+            head_len = min(self._head_length_pt, max(6.0, length * 0.45))
+
             left = QPointF(
                 self._end.x() - head_len * math.cos(angle - arrow_angle),
                 self._end.y() - head_len * math.sin(angle - arrow_angle),
@@ -171,183 +165,8 @@ class ArrowGraphicsItem(QGraphicsPathItem):
         self.setPath(path)
 
 
-class PdfPageGraphicsItem(QGraphicsItem):
-    """
-    High-quality tiled PDF page renderer.
-
-    Scene coordinates are PDF display points: 1 scene unit = 1 PDF point.
-    The item renders only the visible/exposed part of the page and uses a small
-    LRU image cache. This prevents huge QPixmap allocations for large A0 / ANSI
-    engineering drawings while still rendering linework sharply when zoomed in.
-    """
-
-    def __init__(
-        self,
-        page: Any,
-        page_index: int,
-        *,
-        minimum_render_dpi: float = 144.0,
-        maximum_render_dpi: float = 360.0,
-        render_quality: float = 1.25,
-        tile_size_px: int = 1024,
-        cache_limit_mb: int = 256,
-        max_visible_render_pixels: int = 60_000_000,
-        parent: Optional[QGraphicsItem] = None,
-    ) -> None:
-        super().__init__(parent)
-        self.page = page
-        self.page_index = page_index
-        self.display_list = page.get_displaylist(annots=True)
-        self.page_rect = QRectF(0.0, 0.0, float(page.rect.width), float(page.rect.height))
-        self.minimum_render_dpi = float(minimum_render_dpi)
-        self.maximum_render_dpi = float(maximum_render_dpi)
-        self.render_quality = float(render_quality)
-        self.tile_size_px = max(256, int(tile_size_px))
-        self.cache_limit_bytes = max(32, int(cache_limit_mb)) * 1024 * 1024
-        self.max_visible_render_pixels = max(1_000_000, int(max_visible_render_pixels))
-        self._tile_cache: OrderedDict[Tuple[int, int, int, int, int], Tuple[QImage, QRectF, int]] = OrderedDict()
-        self._cache_bytes = 0
-        self._last_error = ""
-
-        self.setData(ITEM_KIND_ROLE, KIND_PAGE)
-        self.setZValue(-100)
-        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
-        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemUsesExtendedStyleOption, True)
-
-    def boundingRect(self) -> QRectF:  # type: ignore[override]
-        return self.page_rect
-
-    def paint(self, painter: QPainter, option: QStyleOptionGraphicsItem, widget: Optional[QWidget] = None) -> None:  # type: ignore[override]
-        painter.save()
-        painter.setClipRect(self.page_rect)
-        painter.fillRect(self.page_rect, QColor("white"))
-
-        exposed = QRectF(option.exposedRect).intersected(self.page_rect)
-        if exposed.isNull() or exposed.isEmpty():
-            exposed = self.page_rect
-
-        try:
-            scale = self._choose_render_scale(painter, exposed)
-            self._paint_tiles(painter, exposed, scale)
-        except Exception as exc:  # noqa: BLE001 - paint events must never crash the process.
-            self._last_error = str(exc)
-            painter.setPen(QColor("red"))
-            painter.drawText(self.page_rect.adjusted(12, 12, -12, -12), Qt.AlignmentFlag.AlignLeft, f"PDF render error: {exc}")
-
-        painter.restore()
-
-    def clear_cache(self) -> None:
-        self._tile_cache.clear()
-        self._cache_bytes = 0
-
-    def _choose_render_scale(self, painter: QPainter, exposed: QRectF) -> float:
-        lod = QStyleOptionGraphicsItem.levelOfDetailFromTransform(painter.worldTransform())
-        if not math.isfinite(lod) or lod <= 0:
-            lod = 1.0
-
-        device = painter.device()
-        device_pixel_ratio = 1.0
-        if hasattr(device, "devicePixelRatioF"):
-            try:
-                device_pixel_ratio = float(device.devicePixelRatioF())
-            except Exception:
-                device_pixel_ratio = 1.0
-
-        desired_scale = lod * device_pixel_ratio * self.render_quality
-        minimum_scale = self.minimum_render_dpi / PDF_POINTS_PER_INCH
-        maximum_scale = self.maximum_render_dpi / PDF_POINTS_PER_INCH
-
-        # Keep full-page fit views sharp, but cap pixels so a very large sheet
-        # cannot allocate an enormous bitmap and crash native Qt/PyMuPDF code.
-        visible_area_pt = max(1.0, exposed.width() * exposed.height())
-        scale_by_pixel_budget = math.sqrt(self.max_visible_render_pixels / visible_area_pt)
-
-        scale = max(minimum_scale, desired_scale)
-        scale = min(scale, maximum_scale, scale_by_pixel_budget)
-        scale = max(0.05, scale)
-        return self._quantize_scale_down(scale)
-
-    @staticmethod
-    def _quantize_scale_down(scale: float) -> float:
-        if scale >= 3.0:
-            step = 0.25
-        elif scale >= 1.0:
-            step = 0.10
-        else:
-            step = 0.05
-        return max(0.05, math.floor(scale / step) * step)
-
-    def _paint_tiles(self, painter: QPainter, exposed: QRectF, scale: float) -> None:
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        tile_pt = self.tile_size_px / max(scale, 0.05)
-        if tile_pt <= 0:
-            return
-
-        # A small overlap prevents anti-aliasing seams between neighboring tiles.
-        pad_pt = min(2.0, max(0.25, 2.0 / max(scale, 0.05)))
-
-        x_start = math.floor(exposed.left() / tile_pt)
-        x_end = math.floor(max(exposed.left(), exposed.right() - 0.001) / tile_pt)
-        y_start = math.floor(exposed.top() / tile_pt)
-        y_end = math.floor(max(exposed.top(), exposed.bottom() - 0.001) / tile_pt)
-
-        painter.setClipRect(exposed)
-        scale_key = int(round(scale * 1000))
-
-        for ty in range(y_start, y_end + 1):
-            for tx in range(x_start, x_end + 1):
-                base_rect = QRectF(tx * tile_pt, ty * tile_pt, tile_pt, tile_pt).intersected(self.page_rect)
-                if base_rect.isNull() or base_rect.isEmpty() or not base_rect.intersects(exposed):
-                    continue
-
-                render_rect = base_rect.adjusted(-pad_pt, -pad_pt, pad_pt, pad_pt).intersected(self.page_rect)
-                image, target_rect = self._get_tile_image(scale, scale_key, tx, ty, render_rect)
-                if not image.isNull():
-                    painter.drawImage(target_rect, image)
-
-    def _get_tile_image(
-        self,
-        scale: float,
-        scale_key: int,
-        tx: int,
-        ty: int,
-        render_rect: QRectF,
-    ) -> Tuple[QImage, QRectF]:
-        key = (self.page_index, scale_key, tx, ty, self.tile_size_px)
-        cached = self._tile_cache.get(key)
-        if cached is not None:
-            image, target_rect, byte_count = cached
-            self._tile_cache.move_to_end(key)
-            return image, target_rect
-
-        clip = fitz.Rect(render_rect.left(), render_rect.top(), render_rect.right(), render_rect.bottom())
-        matrix = fitz.Matrix(scale, scale)
-        pix = self.display_list.get_pixmap(matrix=matrix, colorspace=fitz.csRGB, alpha=False, clip=clip)
-        image = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888).copy()
-        byte_count = self._image_byte_count(image)
-        self._tile_cache[key] = (image, QRectF(render_rect), byte_count)
-        self._cache_bytes += byte_count
-        self._enforce_cache_limit()
-        return image, render_rect
-
-    @staticmethod
-    def _image_byte_count(image: QImage) -> int:
-        if hasattr(image, "sizeInBytes"):
-            try:
-                return int(image.sizeInBytes())
-            except Exception:
-                pass
-        return int(image.bytesPerLine() * image.height())
-
-    def _enforce_cache_limit(self) -> None:
-        while self._cache_bytes > self.cache_limit_bytes and self._tile_cache:
-            _, (_, _, byte_count) = self._tile_cache.popitem(last=False)
-            self._cache_bytes -= byte_count
-
-
 class PdfGraphicsView(QGraphicsView):
-    """QGraphicsView with wheel zoom, middle-button pan, and annotation tools."""
+    """Graphics view for zoom, pan, drawing, and visible-tile updates."""
 
     def __init__(self, editor: "PdfCorrectionEditor", parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -369,14 +188,16 @@ class PdfGraphicsView(QGraphicsView):
         self.setBackgroundBrush(QBrush(QColor("#404040")))
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
-        self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.SmartViewportUpdate)
-        self.setOptimizationFlag(QGraphicsView.OptimizationFlag.DontSavePainterState, True)
+        self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.FullViewportUpdate)
         self.setMouseTracking(True)
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
+    # ---------- Mouse / keyboard interaction ----------
+
     def wheelEvent(self, event) -> None:  # type: ignore[override]
+        """Mouse wheel zooms around the mouse pointer."""
         delta = event.angleDelta().y()
         if delta == 0:
             delta = event.pixelDelta().y()
@@ -385,20 +206,18 @@ class PdfGraphicsView(QGraphicsView):
             return
 
         steps = delta / 120.0
-        factor = 1.15**steps
+        factor = 1.15 ** steps
         self.editor.zoom_at_mouse(factor)
         event.accept()
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
-        event_pos = self._event_pos(event)
-
         if event.button() == Qt.MouseButton.MiddleButton:
-            self._start_pan(event_pos)
+            self._start_pan(event.position().toPoint())
             event.accept()
             return
 
         if event.button() == Qt.MouseButton.LeftButton and self.editor.current_tool:
-            scene_pos = self.mapToScene(event_pos)
+            scene_pos = self.mapToScene(event.position().toPoint())
             if not self.editor.is_point_on_page(scene_pos):
                 event.accept()
                 return
@@ -406,7 +225,14 @@ class PdfGraphicsView(QGraphicsView):
 
             if self.editor.current_tool == KIND_CIRCLE:
                 self._drawing_start = scene_pos
-                self._temp_item = self.editor.create_circle_item(QRectF(scene_pos, scene_pos))
+                self._temp_item = self.editor.create_ellipse_item(QRectF(scene_pos, scene_pos))
+                self.scene().addItem(self._temp_item)
+                event.accept()
+                return
+
+            if self.editor.current_tool == KIND_RECTANGLE:
+                self._drawing_start = scene_pos
+                self._temp_item = self.editor.create_rectangle_item(QRectF(scene_pos, scene_pos))
                 self.scene().addItem(self._temp_item)
                 event.accept()
                 return
@@ -426,19 +252,27 @@ class PdfGraphicsView(QGraphicsView):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
-        event_pos = self._event_pos(event)
-
         if self._panning:
-            self._update_pan(event_pos)
+            self._update_pan(event.position().toPoint())
             event.accept()
             return
 
         if self._drawing_start is not None and self._temp_item is not None:
-            scene_pos = self.editor.clamp_to_page(self.mapToScene(event_pos))
+            scene_pos = self.editor.clamp_to_page(self.mapToScene(event.position().toPoint()))
+            modifiers = QApplication.keyboardModifiers()
+            force_square = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
+
             if self.editor.current_tool == KIND_CIRCLE and isinstance(self._temp_item, QGraphicsEllipseItem):
-                self._temp_item.setRect(self._circle_rect(self._drawing_start, scene_pos))
+                # Normal drag = oval/ellipse. Shift + drag = perfect circle.
+                self._temp_item.setRect(self._drag_rect(self._drawing_start, scene_pos, force_square))
                 event.accept()
                 return
+
+            if self.editor.current_tool == KIND_RECTANGLE and isinstance(self._temp_item, QGraphicsRectItem):
+                self._temp_item.setRect(self._drag_rect(self._drawing_start, scene_pos, force_square))
+                event.accept()
+                return
+
             if self.editor.current_tool == KIND_ARROW and isinstance(self._temp_item, ArrowGraphicsItem):
                 self._temp_item.set_points(self._drawing_start, scene_pos)
                 event.accept()
@@ -489,11 +323,7 @@ class PdfGraphicsView(QGraphicsView):
             return
         super().keyPressEvent(event)
 
-    @staticmethod
-    def _event_pos(event) -> QPoint:
-        if hasattr(event, "position"):
-            return event.position().toPoint()
-        return event.pos()
+    # ---------- Pan helpers ----------
 
     def _start_pan(self, pos: QPoint) -> None:
         self._panning = True
@@ -512,7 +342,10 @@ class PdfGraphicsView(QGraphicsView):
         self.editor.apply_cursor_for_tool()
 
     @staticmethod
-    def _circle_rect(start: QPointF, end: QPointF) -> QRectF:
+    def _drag_rect(start: QPointF, end: QPointF, force_square: bool) -> QRectF:
+        if not force_square:
+            return QRectF(start, end).normalized()
+
         dx = end.x() - start.x()
         dy = end.y() - start.y()
         size = min(abs(dx), abs(dy))
@@ -535,12 +368,14 @@ class PdfCorrectionEditor(QMainWindow):
         Output folder or a full output PDF file path. If a folder is supplied,
         the saved file is '<input_stem>_annotated.pdf' inside that folder.
     minimum_render_dpi:
-        Minimum display render quality when feasible. Use 144 or 200 for crisp
-        engineering line drawings. The code may reduce this only for extremely
-        large visible areas to avoid native crashes.
+        Minimum display render quality for visible PDF tiles. This is back to
+        the previous high-quality default of 200 DPI for large A0/A1 drawings.
     maximum_render_dpi:
         Maximum display render quality when zoomed in. Only visible tiles are
-        rendered at this DPI, so large sheets remain safe.
+        rendered, so large sheets remain safer than a single full-page pixmap.
+    render_quality:
+        Multiplier above the current screen zoom before selecting tile DPI.
+        The previous crisp default is 2.0.
     """
 
     correction_saved = Signal(str)
@@ -553,17 +388,24 @@ class PdfCorrectionEditor(QMainWindow):
         output_path: str | os.PathLike[str],
         parent: Optional[QWidget] = None,
         *,
-        minimum_render_dpi: float = 144.0,
-        maximum_render_dpi: float = 360.0,
-        render_quality: float = 1.25,
-        cache_limit_mb: int = 256,
-        max_visible_render_pixels: int = 60_000_000,
+        minimum_render_dpi: float = 200.0,
+        maximum_render_dpi: float = 600.0,
+        render_quality: float = 2.0,
+        cache_limit_mb: int = 384,
+        max_visible_render_pixels: int = 90_000_000,
+        tile_pixel_size: int = 1024,
         min_zoom: float = 0.02,
         max_zoom: float = 20.0,
         annotation_width_pt: float = 1.5,
         annotation_color: str = "#ff0000",
         default_text_size_pt: int = 12,
     ) -> None:
+        app = QApplication.instance()
+        if app is None:
+            raise RuntimeError("Create QApplication before creating PdfCorrectionEditor.")
+        if parent is not None and not isinstance(parent, QWidget):
+            raise TypeError("parent must be None or a QWidget/QMainWindow. Do not pass Ui_MainWindow as parent.")
+
         super().__init__(parent)
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
@@ -574,11 +416,13 @@ class PdfCorrectionEditor(QMainWindow):
         self.minimum_render_dpi = float(minimum_render_dpi)
         self.maximum_render_dpi = float(maximum_render_dpi)
         self.render_quality = float(render_quality)
-        self.cache_limit_mb = int(cache_limit_mb)
-        self.max_visible_render_pixels = int(max_visible_render_pixels)
+        self.cache_limit_bytes = max(16, int(cache_limit_mb)) * 1024 * 1024
+        self.max_visible_render_pixels = max(1_000_000, int(max_visible_render_pixels))
+        self.tile_pixel_size = max(256, int(tile_pixel_size))
         self.min_zoom = float(min_zoom)
         self.max_zoom = float(max_zoom)
         self.current_zoom = 1.0
+        self.current_render_dpi = self.minimum_render_dpi
         self.annotation_width_pt = float(annotation_width_pt)
         self.annotation_qcolor = QColor(annotation_color)
         self.annotation_rgb = self._qcolor_to_pymupdf_rgb(self.annotation_qcolor)
@@ -588,10 +432,11 @@ class PdfCorrectionEditor(QMainWindow):
         self.current_page_index = 0
         self.current_tool: Optional[str] = None
         self.page_scene_rect = QRectF()
-        self.page_item: Optional[PdfPageGraphicsItem] = None
         self._fit_mode = True
         self._next_annotation_id = 1
+        self._updating_page_spinbox = False
 
+        # Stored annotations for pages that are not currently loaded in the scene.
         self.annotations_by_page: Dict[int, List[Dict[str, Any]]] = {}
         self.undo_stack: List[Tuple[int, int]] = []  # (page_index, annotation_id)
 
@@ -599,8 +444,16 @@ class PdfCorrectionEditor(QMainWindow):
         self.view = self._replace_ui_graphics_view()
         self.view.setScene(self.scene)
 
+        self._page_background_item: Optional[QGraphicsRectItem] = None
+        self._tile_items: List[QGraphicsPixmapItem] = []
+        self._tile_cache: "OrderedDict[Tuple[Any, ...], Tuple[QPixmap, int]]" = OrderedDict()
+        self._tile_cache_bytes = 0
+        self._tile_timer = QTimer(self)
+        self._tile_timer.setSingleShot(True)
+        self._tile_timer.timeout.connect(self.update_visible_tiles)
+
         self.paper_size_label = QLabel(self)
-        self.paper_size_label.setMinimumWidth(560)
+        self.paper_size_label.setMinimumWidth(650)
         self.paper_size_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.statusBar().addPermanentWidget(self.paper_size_label, 1)
 
@@ -615,7 +468,6 @@ class PdfCorrectionEditor(QMainWindow):
         old_view = self.ui.graphicsView
         parent = old_view.parentWidget()
         self.ui.gridLayout.removeWidget(old_view)
-        old_view.setParent(None)
         old_view.deleteLater()
 
         new_view = PdfGraphicsView(self, parent)
@@ -626,32 +478,51 @@ class PdfCorrectionEditor(QMainWindow):
 
     def _configure_ui(self) -> None:
         self.setWindowTitle(f"PDF Correction Editor - {self.input_path.name}")
-        self.ui.viewerWindow.setStyleSheet("background: #404040;")
+        if hasattr(self.ui, "viewerWindow"):
+            self.ui.viewerWindow.setStyleSheet("background: #404040;")
         self.ui.graphicsView.setStyleSheet("QGraphicsView { background: #404040; border: 0px; }")
         self.scene.setBackgroundBrush(QBrush(QColor("#404040")))
 
-        self.ui.btnCircle.setCheckable(True)
-        self.ui.btnArrow.setCheckable(True)
-        self.ui.btnText.setCheckable(True)
+        for name in ("btnCircle", "btnRectangle", "btnArrow", "btnText"):
+            button = getattr(self.ui, name, None)
+            if button is not None:
+                button.setCheckable(True)
 
-        self.ui.spinBoxTextSize.setRange(1, 300)
-        if self.ui.spinBoxTextSize.value() <= 0:
-            self.ui.spinBoxTextSize.setValue(self.default_text_size_pt)
-        self.ui.spinBoxTextSize.setSuffix(" pt")
-        self.ui.spinBoxTextSize.setToolTip("Text size in PDF points")
+        if hasattr(self.ui, "spinBoxTextSize"):
+            self.ui.spinBoxTextSize.setRange(1, 300)
+            if self.ui.spinBoxTextSize.value() <= 0:
+                self.ui.spinBoxTextSize.setValue(self.default_text_size_pt)
+            self.ui.spinBoxTextSize.setSuffix(" pt")
+            self.ui.spinBoxTextSize.setToolTip("Text size in PDF points")
 
-        self.ui.btnCorrection.setToolTip("Save annotated PDF to the configured output path")
+        if hasattr(self.ui, "spinBoxPageNo"):
+            self.ui.spinBoxPageNo.setRange(1, 1)
+            self.ui.spinBoxPageNo.setToolTip("PDF page number")
+
+        if hasattr(self.ui, "btnCorrection"):
+            self.ui.btnCorrection.setToolTip("Save annotated PDF to the configured output path")
+
+        self.view.horizontalScrollBar().valueChanged.connect(lambda _value: self.schedule_tile_update(35))
+        self.view.verticalScrollBar().valueChanged.connect(lambda _value: self.schedule_tile_update(35))
         self.apply_cursor_for_tool()
 
     def _connect_signals(self) -> None:
-        self.ui.btnCircle.clicked.connect(lambda: self.set_tool(KIND_CIRCLE if self.current_tool != KIND_CIRCLE else None))
-        self.ui.btnArrow.clicked.connect(lambda: self.set_tool(KIND_ARROW if self.current_tool != KIND_ARROW else None))
-        self.ui.btnText.clicked.connect(lambda: self.set_tool(KIND_TEXT if self.current_tool != KIND_TEXT else None))
-        self.ui.btnCorrection.clicked.connect(self.save_correction)
-
-        # Hooks for your later logic. Nothing else is implemented for these buttons.
-        self.ui.btnAppr.clicked.connect(self.approve_requested.emit)
-        self.ui.btnCancel.clicked.connect(self.cancel_requested.emit)
+        if hasattr(self.ui, "btnCircle"):
+            self.ui.btnCircle.clicked.connect(lambda: self.set_tool(KIND_CIRCLE if self.current_tool != KIND_CIRCLE else None))
+        if hasattr(self.ui, "btnRectangle"):
+            self.ui.btnRectangle.clicked.connect(lambda: self.set_tool(KIND_RECTANGLE if self.current_tool != KIND_RECTANGLE else None))
+        if hasattr(self.ui, "btnArrow"):
+            self.ui.btnArrow.clicked.connect(lambda: self.set_tool(KIND_ARROW if self.current_tool != KIND_ARROW else None))
+        if hasattr(self.ui, "btnText"):
+            self.ui.btnText.clicked.connect(lambda: self.set_tool(KIND_TEXT if self.current_tool != KIND_TEXT else None))
+        if hasattr(self.ui, "btnCorrection"):
+            self.ui.btnCorrection.clicked.connect(self.save_correction)
+        if hasattr(self.ui, "btnAppr"):
+            self.ui.btnAppr.clicked.connect(self.approve_requested.emit)
+        if hasattr(self.ui, "btnCancel"):
+            self.ui.btnCancel.clicked.connect(self.cancel_requested.emit)
+        if hasattr(self.ui, "spinBoxPageNo"):
+            self.ui.spinBoxPageNo.valueChanged.connect(self._page_spinbox_changed)
 
     def _create_shortcuts(self) -> None:
         undo_action = QAction("Undo last annotation", self)
@@ -679,7 +550,7 @@ class PdfCorrectionEditor(QMainWindow):
         fit_action.triggered.connect(self.fit_page_to_view)
         self.addAction(fit_action)
 
-    # ---------- PDF document ----------
+    # ---------- Documents ----------
 
     def load_pdf(self, input_path: str | os.PathLike[str]) -> None:
         path = Path(input_path).expanduser().resolve()
@@ -702,6 +573,8 @@ class PdfCorrectionEditor(QMainWindow):
         self.annotations_by_page.clear()
         self.undo_stack.clear()
         self._next_annotation_id = 1
+        self._clear_tile_cache()
+        self._update_page_spinbox_range()
         self.render_current_page(fit_after_render=True)
         self.statusBar().showMessage(f"Opened: {path}")
 
@@ -741,7 +614,7 @@ class PdfCorrectionEditor(QMainWindow):
             output_doc.save(str(temporary_target), garbage=4, deflate=True, clean=True)
             output_doc.close()
             os.replace(str(temporary_target), str(target))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 - GUI error for any save failure.
             try:
                 output_doc.close()
             except Exception:
@@ -763,6 +636,7 @@ class PdfCorrectionEditor(QMainWindow):
         if self.document is not None:
             self.document.close()
             self.document = None
+        self._clear_tile_cache()
         super().closeEvent(event)
 
     # ---------- Rendering ----------
@@ -770,36 +644,154 @@ class PdfCorrectionEditor(QMainWindow):
     def render_current_page(self, *, fit_after_render: bool = False) -> None:
         if self.document is None:
             self.scene.clear()
-            self.page_item = None
             self.page_scene_rect = QRectF()
             self._update_status_bar()
             return
 
         self.scene.clear()
+        self._tile_items.clear()
         page = self.document[self.current_page_index]
-        self.page_item = PdfPageGraphicsItem(
-            page,
-            self.current_page_index,
-            minimum_render_dpi=self.minimum_render_dpi,
-            maximum_render_dpi=self.maximum_render_dpi,
-            render_quality=self.render_quality,
-            cache_limit_mb=self.cache_limit_mb,
-            max_visible_render_pixels=self.max_visible_render_pixels,
-        )
-        self.scene.addItem(self.page_item)
-        self.page_scene_rect = self.page_item.boundingRect()
+        self.page_scene_rect = QRectF(0, 0, float(page.rect.width), float(page.rect.height))
         self.scene.setSceneRect(self.page_scene_rect)
+
+        self._page_background_item = QGraphicsRectItem(self.page_scene_rect)
+        self._page_background_item.setData(ITEM_KIND_ROLE, KIND_PAGE_BACKGROUND)
+        self._page_background_item.setPen(QPen(QColor("#bdbdbd"), 0.0))
+        self._page_background_item.setBrush(QBrush(QColor("white")))
+        self._page_background_item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+        self._page_background_item.setZValue(-200)
+        self.scene.addItem(self._page_background_item)
+
         self._restore_page_annotations()
+        self._update_page_spinbox_value()
         self._update_status_bar()
 
         if fit_after_render:
             self._fit_mode = True
             QTimer.singleShot(0, self.fit_page_to_view)
+        else:
+            self.schedule_tile_update(0)
+
+    def schedule_tile_update(self, delay_ms: int = 35) -> None:
+        if self.document is None or self.page_scene_rect.isNull():
+            return
+        self._tile_timer.start(max(0, int(delay_ms)))
+
+    def update_visible_tiles(self) -> None:
+        if self.document is None or self.page_scene_rect.isNull():
+            return
+
+        page = self.document[self.current_page_index]
+        visible_rect = self._visible_page_rect()
+        if visible_rect.isNull() or visible_rect.width() <= 0 or visible_rect.height() <= 0:
+            return
+
+        render_dpi = self._choose_render_dpi(visible_rect)
+        self.current_render_dpi = render_dpi
+        render_scale = render_dpi / PDF_POINTS_PER_INCH
+        tile_scene_size = max(64.0, self.tile_pixel_size / render_scale)
+
+        # Remove existing tile items but keep page background and annotations.
+        for item in self._tile_items:
+            if item.scene() is self.scene:
+                self.scene.removeItem(item)
+        self._tile_items.clear()
+
+        x_start = math.floor(visible_rect.left() / tile_scene_size) * tile_scene_size
+        y_start = math.floor(visible_rect.top() / tile_scene_size) * tile_scene_size
+        x_end = math.ceil(visible_rect.right() / tile_scene_size) * tile_scene_size
+        y_end = math.ceil(visible_rect.bottom() / tile_scene_size) * tile_scene_size
+
+        x = x_start
+        while x < x_end:
+            y = y_start
+            while y < y_end:
+                clip = QRectF(x, y, tile_scene_size, tile_scene_size).intersected(self.page_scene_rect)
+                if clip.width() > 0.5 and clip.height() > 0.5:
+                    pixmap = self._render_tile_pixmap(page, clip, render_dpi)
+                    item = QGraphicsPixmapItem(pixmap)
+                    item.setData(ITEM_KIND_ROLE, KIND_PAGE_TILE)
+                    item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+                    item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+                    item.setZValue(-100)
+                    item.setPos(clip.left(), clip.top())
+                    item.setScale(1.0 / render_scale)
+                    self.scene.addItem(item)
+                    self._tile_items.append(item)
+                y += tile_scene_size
+            x += tile_scene_size
+
+        self._update_status_bar()
+
+    def _visible_page_rect(self) -> QRectF:
+        viewport_rect = self.view.viewport().rect()
+        visible = self.view.mapToScene(viewport_rect).boundingRect().intersected(self.page_scene_rect)
+        if visible.isNull():
+            return visible
+
+        # Prefetch around the viewport so panning does not immediately expose gray.
+        pad_x = visible.width() * 0.15
+        pad_y = visible.height() * 0.15
+        visible.adjust(-pad_x, -pad_y, pad_x, pad_y)
+        return visible.intersected(self.page_scene_rect)
+
+    def _choose_render_dpi(self, visible_rect: QRectF) -> float:
+        target = max(self.minimum_render_dpi, self.current_zoom * PDF_POINTS_PER_INCH * self.render_quality)
+        target = min(self.maximum_render_dpi, target)
+
+        visible_w_in = max(0.01, visible_rect.width() / PDF_POINTS_PER_INCH)
+        visible_h_in = max(0.01, visible_rect.height() / PDF_POINTS_PER_INCH)
+        pixels = visible_w_in * visible_h_in * target * target
+        if pixels > self.max_visible_render_pixels:
+            target *= math.sqrt(self.max_visible_render_pixels / pixels)
+            # Allow reduction only when the visible region is too large. Keep it
+            # as high as practical and never below 120 DPI unless absolutely huge.
+            target = max(120.0, target)
+        return max(72.0, min(self.maximum_render_dpi, target))
+
+    def _render_tile_pixmap(self, page: Any, rect: QRectF, render_dpi: float) -> QPixmap:
+        # Rounded coordinates give stable cache keys while keeping sub-point precision.
+        key = (
+            self.current_page_index,
+            round(render_dpi, 1),
+            round(rect.left(), 2),
+            round(rect.top(), 2),
+            round(rect.right(), 2),
+            round(rect.bottom(), 2),
+        )
+        cached = self._tile_cache.get(key)
+        if cached is not None:
+            pixmap, byte_count = cached
+            self._tile_cache.move_to_end(key)
+            return pixmap
+
+        render_scale = render_dpi / PDF_POINTS_PER_INCH
+        matrix = fitz.Matrix(render_scale, render_scale)
+        clip = fitz.Rect(float(rect.left()), float(rect.top()), float(rect.right()), float(rect.bottom()))
+        pix = page.get_pixmap(matrix=matrix, clip=clip, alpha=False, colorspace=fitz.csRGB, annots=True)
+        image = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888).copy()
+        pixmap = QPixmap.fromImage(image)
+        byte_count = max(1, pixmap.width() * pixmap.height() * 4)
+        self._tile_cache[key] = (pixmap, byte_count)
+        self._tile_cache_bytes += byte_count
+        self._trim_tile_cache()
+        return pixmap
+
+    def _trim_tile_cache(self) -> None:
+        while self._tile_cache_bytes > self.cache_limit_bytes and self._tile_cache:
+            _, (_, byte_count) = self._tile_cache.popitem(last=False)
+            self._tile_cache_bytes -= byte_count
+
+    def _clear_tile_cache(self) -> None:
+        self._tile_cache.clear()
+        self._tile_cache_bytes = 0
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
         if self._fit_mode and not self.page_scene_rect.isNull():
             QTimer.singleShot(0, self.fit_page_to_view)
+        else:
+            self.schedule_tile_update()
 
     def go_to_page(self, page_index: int) -> None:
         if self.document is None:
@@ -810,7 +802,28 @@ class PdfCorrectionEditor(QMainWindow):
             return
         self.collect_current_page_annotations()
         self.current_page_index = page_index
+        self._clear_tile_cache()
         self.render_current_page(fit_after_render=True)
+
+    def _page_spinbox_changed(self, value: int) -> None:
+        if self._updating_page_spinbox:
+            return
+        self.go_to_page(int(value) - 1)
+
+    def _update_page_spinbox_range(self) -> None:
+        if self.document is None or not hasattr(self.ui, "spinBoxPageNo"):
+            return
+        self._updating_page_spinbox = True
+        self.ui.spinBoxPageNo.setRange(1, max(1, int(self.document.page_count)))
+        self.ui.spinBoxPageNo.setValue(self.current_page_index + 1)
+        self._updating_page_spinbox = False
+
+    def _update_page_spinbox_value(self) -> None:
+        if not hasattr(self.ui, "spinBoxPageNo"):
+            return
+        self._updating_page_spinbox = True
+        self.ui.spinBoxPageNo.setValue(self.current_page_index + 1)
+        self._updating_page_spinbox = False
 
     # ---------- Zoom and pan ----------
 
@@ -827,6 +840,7 @@ class PdfCorrectionEditor(QMainWindow):
         self.view.setTransform(QTransform().scale(self.current_zoom, self.current_zoom))
         self.view.centerOn(self.page_scene_rect.center())
         self._fit_mode = True
+        self.schedule_tile_update(0)
         self._update_status_bar()
 
     def zoom_at_mouse(self, factor: float) -> None:
@@ -841,28 +855,32 @@ class PdfCorrectionEditor(QMainWindow):
         self.view.setTransformationAnchor(old_anchor)
 
     def _apply_zoom_factor(self, factor: float) -> None:
-        if self.current_zoom <= 0:
-            self.current_zoom = 1.0
         new_zoom = max(self.min_zoom, min(self.max_zoom, self.current_zoom * factor))
-        actual_factor = new_zoom / self.current_zoom
+        actual_factor = new_zoom / self.current_zoom if self.current_zoom else 1.0
         if abs(actual_factor - 1.0) < 0.0001:
             return
         self.view.scale(actual_factor, actual_factor)
         self.current_zoom = new_zoom
+        self.schedule_tile_update(20)
         self._update_status_bar()
 
     # ---------- Tools ----------
 
     def set_tool(self, tool: Optional[str]) -> None:
         self.current_tool = tool
-        self.ui.btnCircle.setChecked(tool == KIND_CIRCLE)
-        self.ui.btnArrow.setChecked(tool == KIND_ARROW)
-        self.ui.btnText.setChecked(tool == KIND_TEXT)
+        if hasattr(self.ui, "btnCircle"):
+            self.ui.btnCircle.setChecked(tool == KIND_CIRCLE)
+        if hasattr(self.ui, "btnRectangle"):
+            self.ui.btnRectangle.setChecked(tool == KIND_RECTANGLE)
+        if hasattr(self.ui, "btnArrow"):
+            self.ui.btnArrow.setChecked(tool == KIND_ARROW)
+        if hasattr(self.ui, "btnText"):
+            self.ui.btnText.setChecked(tool == KIND_TEXT)
         self.apply_cursor_for_tool()
         self._update_status_bar()
 
     def apply_cursor_for_tool(self) -> None:
-        if self.current_tool in (KIND_CIRCLE, KIND_ARROW):
+        if self.current_tool in (KIND_CIRCLE, KIND_RECTANGLE, KIND_ARROW):
             self.view.setCursor(Qt.CursorShape.CrossCursor)
             self.view.setDragMode(QGraphicsView.DragMode.NoDrag)
         elif self.current_tool == KIND_TEXT:
@@ -872,21 +890,38 @@ class PdfCorrectionEditor(QMainWindow):
             self.view.setCursor(Qt.CursorShape.ArrowCursor)
             self.view.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
 
-    def create_circle_item(self, rect: QRectF, annotation_id: Optional[int] = None) -> QGraphicsEllipseItem:
-        item = QGraphicsEllipseItem(rect.normalized())
+    def _annotation_pen(self) -> QPen:
         pen = QPen(self.annotation_qcolor, self.annotation_width_pt)
         pen.setCosmetic(False)
-        item.setPen(pen)
+        return pen
+
+    def create_ellipse_item(self, rect: QRectF, annotation_id: Optional[int] = None) -> QGraphicsEllipseItem:
+        item = QGraphicsEllipseItem(rect.normalized())
+        item.setPen(self._annotation_pen())
         item.setBrush(QBrush(Qt.BrushStyle.NoBrush))
         self._configure_annotation_item(item, KIND_CIRCLE, annotation_id)
         item.setData(PEN_WIDTH_PT_ROLE, self.annotation_width_pt)
         return item
 
-    def create_arrow_item(self, start: QPointF, end: QPointF, annotation_id: Optional[int] = None) -> ArrowGraphicsItem:
-        pen = QPen(self.annotation_qcolor, self.annotation_width_pt)
-        pen.setCosmetic(False)
-        head_length_pt = max(9.0, self.annotation_width_pt * 8.0)
-        item = ArrowGraphicsItem(start, end, pen, head_length_pt=head_length_pt)
+    # Backward-compatible name if your older code calls create_circle_item.
+    def create_circle_item(self, rect: QRectF, annotation_id: Optional[int] = None) -> QGraphicsEllipseItem:
+        return self.create_ellipse_item(rect, annotation_id)
+
+    def create_rectangle_item(self, rect: QRectF, annotation_id: Optional[int] = None) -> QGraphicsRectItem:
+        item = QGraphicsRectItem(rect.normalized())
+        item.setPen(self._annotation_pen())
+        item.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        self._configure_annotation_item(item, KIND_RECTANGLE, annotation_id)
+        item.setData(PEN_WIDTH_PT_ROLE, self.annotation_width_pt)
+        return item
+
+    def create_arrow_item(
+        self,
+        start: QPointF,
+        end: QPointF,
+        annotation_id: Optional[int] = None,
+    ) -> ArrowGraphicsItem:
+        item = ArrowGraphicsItem(start, end, self._annotation_pen(), head_length_pt=12.0)
         self._configure_annotation_item(item, KIND_ARROW, annotation_id)
         item.setData(PEN_WIDTH_PT_ROLE, self.annotation_width_pt)
         return item
@@ -900,10 +935,11 @@ class PdfCorrectionEditor(QMainWindow):
         if not text:
             return None
 
-        font_size = max(1, int(self.ui.spinBoxTextSize.value()))
+        font_size = max(1, int(self.ui.spinBoxTextSize.value())) if hasattr(self.ui, "spinBoxTextSize") else self.default_text_size_pt
         item = QGraphicsTextItem(text)
         font = QFont("Arial")
-        font.setPixelSize(font_size)
+        # Scene units are PDF points, so use approximately the same scene size.
+        font.setPixelSize(max(1, round(font_size)))
         item.setFont(font)
         item.setDefaultTextColor(self.annotation_qcolor)
         item.setTextWidth(-1)
@@ -914,7 +950,12 @@ class PdfCorrectionEditor(QMainWindow):
         self.register_new_annotation(item)
         return item
 
-    def _configure_annotation_item(self, item: QGraphicsItem, kind: str, annotation_id: Optional[int] = None) -> None:
+    def _configure_annotation_item(
+        self,
+        item: QGraphicsItem,
+        kind: str,
+        annotation_id: Optional[int] = None,
+    ) -> None:
         if annotation_id is None:
             annotation_id = self._take_next_annotation_id()
         item.setData(ITEM_KIND_ROLE, kind)
@@ -961,7 +1002,10 @@ class PdfCorrectionEditor(QMainWindow):
         self._update_status_bar()
 
     def delete_selected_annotations(self) -> None:
-        selected = [item for item in self.scene.selectedItems() if item.data(ITEM_KIND_ROLE) != KIND_PAGE]
+        selected = [
+            item for item in self.scene.selectedItems()
+            if item.data(ITEM_KIND_ROLE) not in (KIND_PAGE_BACKGROUND, KIND_PAGE_TILE)
+        ]
         if not selected:
             return
         selected_ids = {int(item.data(ANNOTATION_ID_ROLE) or 0) for item in selected}
@@ -973,7 +1017,7 @@ class PdfCorrectionEditor(QMainWindow):
 
     def _find_scene_annotation(self, annotation_id: int) -> Optional[QGraphicsItem]:
         for item in self.scene.items():
-            if item.data(ITEM_KIND_ROLE) != KIND_PAGE and int(item.data(ANNOTATION_ID_ROLE) or 0) == annotation_id:
+            if int(item.data(ANNOTATION_ID_ROLE) or 0) == annotation_id:
                 return item
         return None
 
@@ -981,11 +1025,14 @@ class PdfCorrectionEditor(QMainWindow):
         kind = item.data(ITEM_KIND_ROLE)
         if kind == KIND_CIRCLE and isinstance(item, QGraphicsEllipseItem):
             rect = item.mapRectToScene(item.rect()).normalized()
-            return rect.width() < 2.0 or rect.height() < 2.0
+            return rect.width() < 2 or rect.height() < 2
+        if kind == KIND_RECTANGLE and isinstance(item, QGraphicsRectItem):
+            rect = item.mapRectToScene(item.rect()).normalized()
+            return rect.width() < 2 or rect.height() < 2
         if kind == KIND_ARROW and isinstance(item, ArrowGraphicsItem):
             start = item.start_scene()
             end = item.end_scene()
-            return math.hypot(end.x() - start.x(), end.y() - start.y()) < 2.0
+            return math.hypot(end.x() - start.x(), end.y() - start.y()) < 2
         return False
 
     # ---------- Annotation persistence in memory ----------
@@ -995,7 +1042,10 @@ class PdfCorrectionEditor(QMainWindow):
             return
         marks: List[Dict[str, Any]] = []
         overlay_items = sorted(
-            (item for item in self.scene.items() if item.data(ITEM_KIND_ROLE) != KIND_PAGE),
+            (
+                item for item in self.scene.items()
+                if item.data(ITEM_KIND_ROLE) not in (KIND_PAGE_BACKGROUND, KIND_PAGE_TILE)
+            ),
             key=lambda item: int(item.data(ANNOTATION_ID_ROLE) or 0),
         )
         for item in overlay_items:
@@ -1007,6 +1057,16 @@ class PdfCorrectionEditor(QMainWindow):
                 marks.append(
                     {
                         "kind": KIND_CIRCLE,
+                        "id": annotation_id,
+                        "rect": (rect.left(), rect.top(), rect.right(), rect.bottom()),
+                        "pen_width_pt": float(item.data(PEN_WIDTH_PT_ROLE) or self.annotation_width_pt),
+                    }
+                )
+            elif kind == KIND_RECTANGLE and isinstance(item, QGraphicsRectItem):
+                rect = item.mapRectToScene(item.rect()).normalized()
+                marks.append(
+                    {
+                        "kind": KIND_RECTANGLE,
                         "id": annotation_id,
                         "rect": (rect.left(), rect.top(), rect.right(), rect.bottom()),
                         "pen_width_pt": float(item.data(PEN_WIDTH_PT_ROLE) or self.annotation_width_pt),
@@ -1032,7 +1092,10 @@ class PdfCorrectionEditor(QMainWindow):
                         "id": annotation_id,
                         "pos": (pos.x(), pos.y()),
                         "text": item.toPlainText(),
-                        "font_size_pt": int(item.data(FONT_SIZE_PT_ROLE) or self.ui.spinBoxTextSize.value()),
+                        "font_size_pt": int(
+                            item.data(FONT_SIZE_PT_ROLE)
+                            or (self.ui.spinBoxTextSize.value() if hasattr(self.ui, "spinBoxTextSize") else self.default_text_size_pt)
+                        ),
                     }
                 )
         self.annotations_by_page[self.current_page_index] = marks
@@ -1046,7 +1109,15 @@ class PdfCorrectionEditor(QMainWindow):
 
             if kind == KIND_CIRCLE:
                 x0, y0, x1, y1 = mark["rect"]
-                item = self.create_circle_item(
+                item = self.create_ellipse_item(
+                    QRectF(QPointF(float(x0), float(y0)), QPointF(float(x1), float(y1))),
+                    annotation_id=annotation_id,
+                )
+                item.setData(PEN_WIDTH_PT_ROLE, float(mark.get("pen_width_pt", self.annotation_width_pt)))
+                self.scene.addItem(item)
+            elif kind == KIND_RECTANGLE:
+                x0, y0, x1, y1 = mark["rect"]
+                item = self.create_rectangle_item(
                     QRectF(QPointF(float(x0), float(y0)), QPointF(float(x1), float(y1))),
                     annotation_id=annotation_id,
                 )
@@ -1065,9 +1136,9 @@ class PdfCorrectionEditor(QMainWindow):
             elif kind == KIND_TEXT:
                 x, y = mark["pos"]
                 item = QGraphicsTextItem(str(mark.get("text", "")))
-                font_size = int(mark.get("font_size_pt", self.ui.spinBoxTextSize.value()))
+                font_size = int(mark.get("font_size_pt", self.default_text_size_pt))
                 font = QFont("Arial")
-                font.setPixelSize(font_size)
+                font.setPixelSize(max(1, round(font_size)))
                 item.setFont(font)
                 item.setDefaultTextColor(self.annotation_qcolor)
                 item.setTextWidth(-1)
@@ -1088,13 +1159,15 @@ class PdfCorrectionEditor(QMainWindow):
             for mark in marks:
                 kind = mark.get("kind")
                 if kind == KIND_CIRCLE:
-                    self._write_circle(page, mark)
+                    self._write_ellipse(page, mark)
+                elif kind == KIND_RECTANGLE:
+                    self._write_rectangle(page, mark)
                 elif kind == KIND_ARROW:
                     self._write_arrow(page, mark)
                 elif kind == KIND_TEXT:
                     self._write_text(page, mark)
 
-    def _write_circle(self, page: Any, mark: Dict[str, Any]) -> None:
+    def _mark_rect_to_pdf_rect(self, page: Any, mark: Dict[str, Any]) -> Any:
         x0, y0, x1, y1 = mark["rect"]
         corners = [
             QPointF(float(x0), float(y0)),
@@ -1105,9 +1178,19 @@ class PdfCorrectionEditor(QMainWindow):
         points = [self.scene_point_to_pdf_point(page, p) for p in corners]
         xs = [p.x for p in points]
         ys = [p.y for p in points]
-        pdf_rect = fitz.Rect(min(xs), min(ys), max(xs), max(ys))
+        return fitz.Rect(min(xs), min(ys), max(xs), max(ys))
+
+    def _write_ellipse(self, page: Any, mark: Dict[str, Any]) -> None:
         page.draw_oval(
-            pdf_rect,
+            self._mark_rect_to_pdf_rect(page, mark),
+            color=self.annotation_rgb,
+            width=float(mark.get("pen_width_pt", self.annotation_width_pt)),
+            overlay=True,
+        )
+
+    def _write_rectangle(self, page: Any, mark: Dict[str, Any]) -> None:
+        page.draw_rect(
+            self._mark_rect_to_pdf_rect(page, mark),
             color=self.annotation_rgb,
             width=float(mark.get("pen_width_pt", self.annotation_width_pt)),
             overlay=True,
@@ -1131,14 +1214,8 @@ class PdfCorrectionEditor(QMainWindow):
         angle = math.atan2(dy, dx)
         arrow_angle = math.radians(28.0)
         head_len = max(8.0, width * 7.0)
-        left = fitz.Point(
-            end.x - head_len * math.cos(angle - arrow_angle),
-            end.y - head_len * math.sin(angle - arrow_angle),
-        )
-        right = fitz.Point(
-            end.x - head_len * math.cos(angle + arrow_angle),
-            end.y - head_len * math.sin(angle + arrow_angle),
-        )
+        left = fitz.Point(end.x - head_len * math.cos(angle - arrow_angle), end.y - head_len * math.sin(angle - arrow_angle))
+        right = fitz.Point(end.x - head_len * math.cos(angle + arrow_angle), end.y - head_len * math.sin(angle + arrow_angle))
         page.draw_line(end, left, color=self.annotation_rgb, width=width, overlay=True)
         page.draw_line(end, right, color=self.annotation_rgb, width=width, overlay=True)
 
@@ -1147,7 +1224,7 @@ class PdfCorrectionEditor(QMainWindow):
         if not text:
             return
         x, y = mark["pos"]
-        font_size = int(mark.get("font_size_pt", self.ui.spinBoxTextSize.value()))
+        font_size = int(mark.get("font_size_pt", self.default_text_size_pt))
         line_height_scene = font_size * 1.20
 
         for i, line in enumerate(text.splitlines()):
@@ -1165,9 +1242,7 @@ class PdfCorrectionEditor(QMainWindow):
             )
 
     def scene_point_to_pdf_point(self, page: Any, point: QPointF) -> Any:
-        # Scene coordinates are page display points. If a PDF page has a /Rotate
-        # value, derotation_matrix maps display coordinates to the PDF's base
-        # coordinate system before PyMuPDF drawing commands are applied.
+        """Convert scene coordinates in displayed page points to PDF page points."""
         p = fitz.Point(float(point.x()), float(point.y()))
         rotation = int(getattr(page, "rotation", 0) or 0) % 360
         if rotation:
@@ -1197,9 +1272,9 @@ class PdfCorrectionEditor(QMainWindow):
         page_text = f"Page {self.current_page_index + 1}/{self.document.page_count}"
         paper_text = self._paper_size_text(page)
         zoom_text = f"Zoom {self.current_zoom * 100:.0f}%"
+        dpi_text = f"Render {self.current_render_dpi:.0f} DPI"
         tool_text = self.current_tool.title() if self.current_tool else "Select"
-        render_text = f"Render {self.minimum_render_dpi:.0f}-{self.maximum_render_dpi:.0f} DPI"
-        self.paper_size_label.setText(f"{page_text} | {paper_text} | {zoom_text} | {render_text} | Tool: {tool_text}")
+        self.paper_size_label.setText(f"{page_text} | {paper_text} | {zoom_text} | {dpi_text} | Tool: {tool_text}")
 
     def _paper_size_text(self, page: Any) -> str:
         width_pt = float(page.rect.width)
