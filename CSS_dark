@@ -1,0 +1,104 @@
+QTableWidget,
+QTableView {
+    background-color: #111827;
+    alternate-background-color: #1f2937;
+    color: #e5e7eb;
+
+    gridline-color: #374151;
+    border: 1px solid #374151;
+    border-radius: 10px;
+
+    selection-background-color: #2563eb;
+    selection-color: #ffffff;
+
+    font-size: 14px;
+    padding: 4px;
+}
+
+QTableWidget::item,
+QTableView::item {
+    padding: 8px;
+    border: none;
+}
+
+QTableWidget::item:hover,
+QTableView::item:hover {
+    background-color: #374151;
+}
+
+QTableWidget::item:selected,
+QTableView::item:selected {
+    background-color: #2563eb;
+    color: #ffffff;
+}
+
+/* Horizontal and vertical headers */
+QHeaderView::section {
+    background-color: #0f172a;
+    color: #f9fafb;
+
+    padding: 8px;
+    border: none;
+    border-right: 1px solid #374151;
+    border-bottom: 1px solid #374151;
+
+    font-weight: bold;
+    font-size: 14px;
+}
+
+QHeaderView::section:hover {
+    background-color: #1e293b;
+}
+
+/* Top-left corner button */
+QTableCornerButton::section {
+    background-color: #0f172a;
+    border: none;
+    border-right: 1px solid #374151;
+    border-bottom: 1px solid #374151;
+}
+
+/* Scrollbars */
+QScrollBar:vertical {
+    background-color: #111827;
+    width: 12px;
+    margin: 0px;
+    border-radius: 6px;
+}
+
+QScrollBar::handle:vertical {
+    background-color: #4b5563;
+    min-height: 24px;
+    border-radius: 6px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background-color: #6b7280;
+}
+
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical {
+    height: 0px;
+}
+
+QScrollBar:horizontal {
+    background-color: #111827;
+    height: 12px;
+    margin: 0px;
+    border-radius: 6px;
+}
+
+QScrollBar::handle:horizontal {
+    background-color: #4b5563;
+    min-width: 24px;
+    border-radius: 6px;
+}
+
+QScrollBar::handle:horizontal:hover {
+    background-color: #6b7280;
+}
+
+QScrollBar::add-line:horizontal,
+QScrollBar::sub-line:horizontal {
+    width: 0px;
+}
