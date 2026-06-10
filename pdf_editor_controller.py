@@ -17,8 +17,8 @@ Key design notes
   - The scene coordinate system uses PDF points (1 pt = 1/72 inch) directly.
     No artificial scaling is applied; zoom is handled by the view transform only.
   - Tiles are rendered with PyMuPDF at a DPI chosen so that one rendered pixel
-    maps to exactly one logical screen pixel at the current zoom level, then
-    multiplied by ``render_quality`` (default 3.0) for sharpness.
+    maps to exactly one logical screen pixel at the current zoom level.
+    This matches the Acrobat-like rendering that keeps A0/A1 linework sharp.
   - DPI is capped at ``maximum_render_dpi`` and floored at ``minimum_render_dpi``
     so that very small zoom levels still look acceptable.
   - On HiDPI / Retina screens the device pixel ratio is read from QScreen and
@@ -73,6 +73,7 @@ from PySide6.QtWidgets import (
     QGraphicsScene,
     QGraphicsTextItem,
     QGraphicsView,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -194,71 +195,101 @@ class ArrowGraphicsItem(QGraphicsPathItem):
 
 
 # ---------------------------------------------------------------------------
-# EditableTextItem
+# TextAnnotationItem
 # ---------------------------------------------------------------------------
 
-class EditableTextItem(QGraphicsTextItem):
-    """Text annotation that opens an in-place editor where the user clicked.
-
-    The dashed outline is only an editor aid; it is not written to the PDF.
-    """
+class TextAnnotationItem(QGraphicsTextItem):
+    """Inline editable text box placed directly at the mouse click point."""
 
     def __init__(
         self,
-        editor: "PdfCorrectionEditor",
         text: str = "",
+        editor: Optional["PdfCorrectionEditor"] = None,
         parent: Optional[QGraphicsItem] = None,
     ) -> None:
         super().__init__(text, parent)
         self.editor = editor
-        self._min_box_width_pt = 80.0
-        self._min_box_height_pt = 24.0
-        self.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        self._editing = False
+        self._finishing = False
+        self._minimum_box = QRectF(0.0, 0.0, 100.0, 24.0)
 
-    def set_min_box_size(self, width_pt: float, height_pt: float) -> None:
+    def set_minimum_box_size(self, width_pt: float, height_pt: float) -> None:
         self.prepareGeometryChange()
-        self._min_box_width_pt = max(8.0, float(width_pt))
-        self._min_box_height_pt = max(8.0, float(height_pt))
-        self.update()
+        self._minimum_box = QRectF(
+            0.0,
+            0.0,
+            max(8.0, float(width_pt)),
+            max(8.0, float(height_pt)),
+        )
+
+    def boundingRect(self) -> QRectF:  # type: ignore[override]
+        base = super().boundingRect()
+        if self._editing or not self.toPlainText().strip():
+            return base.united(self._minimum_box)
+        return base
 
     def start_editing(self) -> None:
+        self._editing = True
         self.setTextInteractionFlags(Qt.TextInteractionFlag.TextEditorInteraction)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsFocusable, True)
         self.setFocus(Qt.FocusReason.MouseFocusReason)
         cursor = self.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         self.setTextCursor(cursor)
         self.update()
 
-    def boundingRect(self) -> QRectF:  # type: ignore[override]
-        rect = super().boundingRect()
-        return QRectF(
-            rect.left(),
-            rect.top(),
-            max(rect.width(), self._min_box_width_pt),
-            max(rect.height(), self._min_box_height_pt),
-        )
+    def finish_editing(self, *, remove_if_empty: bool = True) -> None:
+        if self._finishing:
+            return
+        self._finishing = True
+        self._editing = False
 
-    def paint(self, painter, option, widget=None) -> None:  # type: ignore[override]
+        if remove_if_empty and not self.toPlainText().strip():
+            if self.editor is not None:
+                self.editor.remove_annotation_item(self, remove_from_undo=True)
+            elif self.scene() is not None:
+                self.scene().removeItem(self)
+            self._finishing = False
+            return
+
+        self.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsFocusable, False)
+        self.update()
+        if self.editor is not None:
+            self.editor._update_status_bar()
+        self._finishing = False
+
+    def focusOutEvent(self, event) -> None:  # type: ignore[override]
+        super().focusOutEvent(event)
+        self.finish_editing(remove_if_empty=True)
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if event.key() == Qt.Key.Key_Escape:
+            self.finish_editing(remove_if_empty=True)
+            event.accept()
+            return
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            modifiers = event.modifiers()
+            if modifiers & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier):
+                self.clearFocus()
+                self.finish_editing(remove_if_empty=True)
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
+    def paint(self, painter: QPainter, option, widget=None) -> None:  # type: ignore[override]
         super().paint(painter, option, widget)
-        if self.hasFocus() or self.isSelected() or not self.toPlainText().strip():
+        if self._editing or not self.toPlainText().strip():
             painter.save()
-            pen = QPen(self.editor.annotation_qcolor, 0.0)
-            pen.setCosmetic(True)
+            color = self.defaultTextColor()
+            if not color.isValid():
+                color = QColor("#ff0000")
+            pen = QPen(color, 0.0)
             pen.setStyle(Qt.PenStyle.DashLine)
             painter.setPen(pen)
             painter.setBrush(QBrush(Qt.BrushStyle.NoBrush))
             painter.drawRect(self.boundingRect().adjusted(0.5, 0.5, -0.5, -0.5))
             painter.restore()
-
-    def focusOutEvent(self, event) -> None:  # type: ignore[override]
-        super().focusOutEvent(event)
-        self.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
-        QTimer.singleShot(0, lambda: self.editor.remove_text_item_if_empty(self))
-        self.update()
-
-    def mouseDoubleClickEvent(self, event) -> None:  # type: ignore[override]
-        self.start_editing()
-        super().mouseDoubleClickEvent(event)
 
 
 # ---------------------------------------------------------------------------
@@ -288,11 +319,15 @@ class PdfGraphicsView(QGraphicsView):
         self._pan_h_value = 0
         self._pan_v_value = 0
 
-        self.setRenderHints(
+        hints = (
             QPainter.RenderHint.Antialiasing
             | QPainter.RenderHint.TextAntialiasing
-            | QPainter.RenderHint.SmoothPixmapTransform
         )
+        # Screen-matched PDF tiles should not be smoothed by Qt; otherwise
+        # thin CAD/CAM/engineering lines become pale after scaling.
+        if not getattr(editor, "screen_matched_rendering", True):
+            hints |= QPainter.RenderHint.SmoothPixmapTransform
+        self.setRenderHints(hints)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setBackgroundBrush(QBrush(QColor("#404040")))
@@ -508,12 +543,13 @@ class PdfCorrectionEditor(QMainWindow):
         When a folder is given the output file is ``<stem>_annotated.pdf``
         inside that folder.
     minimum_render_dpi:
-        Floor for tile render DPI.  150 gives crisp fit-to-page on A0.
+        Floor for tile render DPI. In the default Acrobat-like mode this is ignored, so old high-DPI settings cannot soften A0/A1 linework.
     maximum_render_dpi:
         Ceiling for tile render DPI.  600 is safe for up to ~30× zoom.
     render_quality:
-        Oversample factor.  3.0 renders at 3× the number of pixels needed
-        to fill the screen, giving crisp sub-pixel edges on all sheet sizes.
+        Oversample factor used only when screen_matched_rendering=False.
+        In the default Acrobat-like mode the viewer ignores this value so A0/A1
+        sheets are not over-rendered and softened by downscaling.
     cache_limit_mb:
         Maximum tile-cache memory in MB.  512 MB is comfortable for A0 work.
     """
@@ -528,9 +564,9 @@ class PdfCorrectionEditor(QMainWindow):
         output_path: str | os.PathLike[str],
         parent: Optional[QWidget] = None,
         *,
-        minimum_render_dpi: float = 150.0,
+        minimum_render_dpi: float = 24.0,
         maximum_render_dpi: float = 600.0,
-        render_quality: float = 3.0,
+        render_quality: float = 1.0,
         cache_limit_mb: int = 512,
         max_visible_render_pixels: int = 200_000_000,
         tile_pixel_size: int = 2048,
@@ -539,10 +575,14 @@ class PdfCorrectionEditor(QMainWindow):
         annotation_width_pt: float = 1.5,
         annotation_color: str = "#ff0000",
         default_text_size_pt: int = 15,
-        auto_text_size: bool = True,
-        a4_text_size_pt: float = 15.0,
+        screen_matched_rendering: bool = True,
+        graphics_min_line_width_px: float = 1.0,
+        auto_text_size_by_paper: bool = True,
+        base_text_size_a4_pt: float = 15.0,
         min_auto_text_size_pt: int = 8,
-        max_auto_text_size_pt: int = 90,
+        max_auto_text_size_pt: int = 150,
+        auto_text_size: Optional[bool] = None,
+        a4_text_size_pt: Optional[float] = None,
     ) -> None:
         if QApplication.instance() is None:
             raise RuntimeError(
@@ -566,6 +606,8 @@ class PdfCorrectionEditor(QMainWindow):
         self.minimum_render_dpi = float(minimum_render_dpi)
         self.maximum_render_dpi = float(maximum_render_dpi)
         self.render_quality = float(render_quality)
+        self.screen_matched_rendering = bool(screen_matched_rendering)
+        self.graphics_min_line_width_px = float(graphics_min_line_width_px)
         self.cache_limit_bytes = max(16, int(cache_limit_mb)) * 1024 * 1024
         self.max_visible_render_pixels = max(1_000_000, int(max_visible_render_pixels))
         self.tile_pixel_size = max(256, int(tile_pixel_size))
@@ -579,11 +621,15 @@ class PdfCorrectionEditor(QMainWindow):
         self.annotation_qcolor = QColor(annotation_color)
         self.annotation_rgb = self._qcolor_to_pymupdf_rgb(self.annotation_qcolor)
         self.default_text_size_pt = int(default_text_size_pt)
-        self.auto_text_size = bool(auto_text_size)
-        self.a4_text_size_pt = float(a4_text_size_pt)
+        if auto_text_size is not None:
+            auto_text_size_by_paper = bool(auto_text_size)
+        if a4_text_size_pt is not None:
+            base_text_size_a4_pt = float(a4_text_size_pt)
+        self.auto_text_size_by_paper = bool(auto_text_size_by_paper)
+        self.base_text_size_a4_pt = float(base_text_size_a4_pt)
         self.min_auto_text_size_pt = int(min_auto_text_size_pt)
         self.max_auto_text_size_pt = int(max_auto_text_size_pt)
-        self.current_text_size_auto_pt = self.default_text_size_pt
+        self._apply_mupdf_graphics_options()
 
         self.document: Optional[Any] = None
         self.current_page_index: int = 0
@@ -670,8 +716,8 @@ class PdfCorrectionEditor(QMainWindow):
                 sb.setValue(self.default_text_size_pt)
             sb.setSuffix(" pt")
             sb.setToolTip(
-                "Font size for new text annotations. "
-                "It is auto-set by paper size; A4 = 15 pt."
+                "Font size for new text annotations. Auto-set from paper size; "
+                "A4 uses 15 pt as the reference."
             )
 
         # Page spinbox
@@ -854,7 +900,7 @@ class PdfCorrectionEditor(QMainWindow):
             0.0, 0.0, float(page.rect.width), float(page.rect.height)
         )
         self.scene.setSceneRect(self.page_scene_rect)
-        self._apply_auto_text_size_for_page(page)
+        self._apply_auto_text_size_for_current_page()
 
         # White page background (appears behind tiles)
         bg = QGraphicsRectItem(self.page_scene_rect)
@@ -924,7 +970,9 @@ class PdfCorrectionEditor(QMainWindow):
                         QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False
                     )
                     tile_item.setTransformationMode(
-                        Qt.TransformationMode.SmoothTransformation
+                        Qt.TransformationMode.FastTransformation
+                        if self.screen_matched_rendering
+                        else Qt.TransformationMode.SmoothTransformation
                     )
                     tile_item.setZValue(-100)
                     tile_item.setPos(clip.left(), clip.top())
@@ -993,21 +1041,35 @@ class PdfCorrectionEditor(QMainWindow):
         dpi_y = vp_px_h / page_in_h
         screen_dpi = max(dpi_x, dpi_y)
 
-        # Oversample by render_quality, account for HiDPI device pixel ratio
+        # Acrobat-like rendering mode:
+        #   Render at the actual screen pixel density and let MuPDF's
+        #   thin-line option keep CAD/engineering linework visible.  Do not
+        #   oversample and downscale in this mode; that is what made A0 sheets
+        #   look pale/blurred compared with Acrobat.  We intentionally ignore
+        #   high minimum_render_dpi / render_quality values here so older call
+        #   sites cannot accidentally switch the viewer back to the soft
+        #   downscaled pipeline.
         dpr = self._device_pixel_ratio()
-        target = screen_dpi * self.render_quality * dpr
+        if self.screen_matched_rendering:
+            target = screen_dpi * dpr
+            dpi_floor = 1.0
+        else:
+            target = screen_dpi * self.render_quality * dpr
+            dpi_floor = max(1.0, self.minimum_render_dpi)
 
-        # Pixel-count guard: avoid allocating gigantic bitmaps for extreme zoom
-        page_in = (
-            self.page_scene_rect.width() / PDF_POINTS_PER_INCH,
-            self.page_scene_rect.height() / PDF_POINTS_PER_INCH,
+        # Pixel-count guard: protect only the visible tile region, not the whole
+        # sheet. A0 pages can remain crisp at fit-to-page without forcing a huge
+        # full-page bitmap allocation.
+        visible_in = (
+            max(0.001, visible_scene.width() / PDF_POINTS_PER_INCH),
+            max(0.001, visible_scene.height() / PDF_POINTS_PER_INCH),
         )
-        pixels_at_target = page_in[0] * page_in[1] * target * target
+        pixels_at_target = visible_in[0] * visible_in[1] * target * target
         if pixels_at_target > self.max_visible_render_pixels:
             target *= math.sqrt(self.max_visible_render_pixels / pixels_at_target)
-            target = max(self.minimum_render_dpi, target)
+            target = max(dpi_floor, target)
 
-        return max(72.0, min(self.maximum_render_dpi, max(self.minimum_render_dpi, target)))
+        return max(dpi_floor, min(self.maximum_render_dpi, target))
 
     def _device_pixel_ratio(self) -> float:
         """Return the device pixel ratio of the screen that hosts the window."""
@@ -1261,28 +1323,33 @@ class PdfCorrectionEditor(QMainWindow):
         self,
         scene_pos: QPointF,
         text: Optional[str] = None,
+        *,
+        start_editing: Optional[bool] = None,
     ) -> Optional[QGraphicsTextItem]:
-        """Create a text box directly at the clicked PDF position.
+        """Create a text annotation directly at the clicked PDF location.
 
-        When ``text`` is None this opens an in-place editor on the page instead
-        of showing a dialog box.  Programmatic callers may still pass text.
+        When ``text`` is omitted the item is inserted as an editable text box
+        with keyboard focus, so the user can type immediately at the click
+        point.  The old modal input dialog is intentionally not used.
         """
-        interactive = text is None
-        initial_text = "" if text is None else str(text).strip()
-        if not interactive and not initial_text:
+        interactive = text is None if start_editing is None else bool(start_editing)
+        initial_text = "" if text is None else str(text)
+        if not interactive and not initial_text.strip():
             return None
 
         font_size_pt = self.current_text_size_pt()
-        item = EditableTextItem(self, initial_text)
+        item = TextAnnotationItem(initial_text, editor=self)
         font = QFont("Arial")
         # Use setPointSizeF so the font size is in PDF points (scene units),
         # matching the coordinate system exactly.
         font.setPointSizeF(max(1.0, float(font_size_pt)))
         item.setFont(font)
         item.setDefaultTextColor(self.annotation_qcolor)
-        item.setTextWidth(-1)  # grow with typed text; do not auto-wrap silently
-        box_w, box_h = self._text_box_min_size(font_size_pt)
-        item.set_min_box_size(box_w, box_h)
+        item.setTextWidth(-1)
+        item.set_minimum_box_size(
+            max(90.0, float(font_size_pt) * 6.0),
+            max(20.0, float(font_size_pt) * 1.7),
+        )
         item.setPos(self.clamp_to_page(scene_pos))
         self._configure_annotation_item(item, KIND_TEXT)
         item.setData(FONT_SIZE_PT_ROLE, font_size_pt)
@@ -1290,8 +1357,15 @@ class PdfCorrectionEditor(QMainWindow):
         self.register_new_annotation(item)
 
         if interactive:
-            QTimer.singleShot(0, lambda item=item: self._start_editing_text_item(item))
+            item.start_editing()
+        else:
+            item.finish_editing(remove_if_empty=False)
         return item
+
+    def current_text_size_pt(self) -> int:
+        if hasattr(self.ui, "spinBoxTextSize"):
+            return max(1, int(self.ui.spinBoxTextSize.value()))
+        return max(1, int(self.default_text_size_pt))
 
     def _configure_annotation_item(
         self,
@@ -1306,7 +1380,6 @@ class PdfCorrectionEditor(QMainWindow):
         item.setFlags(
             QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
             | QGraphicsItem.GraphicsItemFlag.ItemIsMovable
-            | QGraphicsItem.GraphicsItemFlag.ItemIsFocusable
             | QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges
         )
         item.setZValue(50)
@@ -1328,22 +1401,13 @@ class PdfCorrectionEditor(QMainWindow):
         self.undo_stack.append((self.current_page_index, aid))
         self._update_status_bar()
 
-    def _start_editing_text_item(self, item: EditableTextItem) -> None:
-        if item.scene() is not self.scene:
-            return
-        self.view.setFocus(Qt.FocusReason.MouseFocusReason)
-        self.scene.clearSelection()
-        item.setSelected(True)
-        item.start_editing()
-
-    def remove_text_item_if_empty(self, item: QGraphicsTextItem) -> None:
-        if item.scene() is not self.scene:
-            return
-        if item.toPlainText().strip():
-            return
+    def remove_annotation_item(
+        self, item: QGraphicsItem, *, remove_from_undo: bool = False
+    ) -> None:
         aid = int(item.data(ANNOTATION_ID_ROLE) or 0)
-        self.scene.removeItem(item)
-        if aid:
+        if item.scene() is self.scene:
+            self.scene.removeItem(item)
+        if remove_from_undo and aid > 0:
             self.undo_stack = [entry for entry in self.undo_stack if entry[1] != aid]
         self._update_status_bar()
 
@@ -1472,8 +1536,8 @@ class PdfCorrectionEditor(QMainWindow):
                     }
                 )
             elif kind == KIND_TEXT and isinstance(item, QGraphicsTextItem):
-                text_value = item.toPlainText()
-                if not text_value.strip():
+                plain_text = item.toPlainText().strip()
+                if not plain_text:
                     continue
                 pos = item.scenePos()
                 marks.append(
@@ -1481,7 +1545,7 @@ class PdfCorrectionEditor(QMainWindow):
                         "kind": KIND_TEXT,
                         "id": aid,
                         "pos": (pos.x(), pos.y()),
-                        "text": text_value,
+                        "text": plain_text,
                         "font_size_pt": int(
                             item.data(FONT_SIZE_PT_ROLE) or self.default_text_size_pt
                         ),
@@ -1537,17 +1601,20 @@ class PdfCorrectionEditor(QMainWindow):
             elif kind == KIND_TEXT:
                 x, y = mark["pos"]
                 font_size = int(mark.get("font_size_pt", self.default_text_size_pt))
-                item = EditableTextItem(self, str(mark.get("text", "")))
+                item = TextAnnotationItem(str(mark.get("text", "")), editor=self)
                 font = QFont("Arial")
                 font.setPointSizeF(max(1.0, float(font_size)))
                 item.setFont(font)
                 item.setDefaultTextColor(self.annotation_qcolor)
                 item.setTextWidth(-1)
-                box_w, box_h = self._text_box_min_size(font_size)
-                item.set_min_box_size(box_w, box_h)
+                item.set_minimum_box_size(
+                    max(90.0, float(font_size) * 6.0),
+                    max(20.0, float(font_size) * 1.7),
+                )
                 item.setPos(QPointF(float(x), float(y)))
                 self._configure_annotation_item(item, KIND_TEXT, annotation_id=aid)
                 item.setData(FONT_SIZE_PT_ROLE, font_size)
+                item.finish_editing(remove_if_empty=False)
                 self.scene.addItem(item)
 
         self._next_annotation_id = max(self._next_annotation_id, max_id + 1)
@@ -1668,6 +1735,45 @@ class PdfCorrectionEditor(QMainWindow):
         return p
 
     # ======================================================================
+    # Text-size automation / rendering options
+    # ======================================================================
+
+    def _apply_mupdf_graphics_options(self) -> None:
+        """Optionally ask MuPDF to keep very thin vector lines visible during rendering."""
+        width_px = max(0.0, float(self.graphics_min_line_width_px))
+        tools = getattr(fitz, "TOOLS", None)
+        setter = getattr(tools, "set_graphics_min_line_width", None) if tools is not None else None
+        if setter is None:
+            return
+        try:
+            setter(width_px)
+        except Exception:
+            # Older PyMuPDF builds may not support this; rendering still works.
+            pass
+
+    def _apply_auto_text_size_for_current_page(self) -> None:
+        if not self.auto_text_size_by_paper:
+            return
+        if self.document is None or not hasattr(self.ui, "spinBoxTextSize"):
+            return
+        size = self._auto_text_size_for_page(self.document[self.current_page_index])
+        sb = self.ui.spinBoxTextSize
+        old_block = sb.blockSignals(True)
+        sb.setValue(size)
+        sb.blockSignals(old_block)
+        self.default_text_size_pt = int(size)
+
+    def _auto_text_size_for_page(self, page: Any) -> int:
+        """Scale text from an A4 reference: A4=15 pt, A3≈21, A2≈30, A1≈42, A0≈60."""
+        w_mm = float(page.rect.width) * MM_PER_INCH / PDF_POINTS_PER_INCH
+        h_mm = float(page.rect.height) * MM_PER_INCH / PDF_POINTS_PER_INCH
+        a4_area = 210.0 * 297.0
+        page_area = max(1.0, w_mm * h_mm)
+        scale = math.sqrt(page_area / a4_area)
+        size = int(round(self.base_text_size_a4_pt * scale))
+        return max(self.min_auto_text_size_pt, min(self.max_auto_text_size_pt, size))
+
+    # ======================================================================
     # Page geometry & status bar
     # ======================================================================
 
@@ -1680,33 +1786,6 @@ class PdfCorrectionEditor(QMainWindow):
         x = max(self.page_scene_rect.left(), min(scene_pos.x(), self.page_scene_rect.right()))
         y = max(self.page_scene_rect.top(), min(scene_pos.y(), self.page_scene_rect.bottom()))
         return QPointF(x, y)
-
-    def current_text_size_pt(self) -> int:
-        if hasattr(self.ui, "spinBoxTextSize"):
-            return max(1, int(self.ui.spinBoxTextSize.value()))
-        return max(1, int(self.default_text_size_pt))
-
-    def _apply_auto_text_size_for_page(self, page: Any) -> None:
-        size_pt = self._auto_text_size_for_page(page)
-        self.current_text_size_auto_pt = size_pt
-        if self.auto_text_size and hasattr(self.ui, "spinBoxTextSize"):
-            self.ui.spinBoxTextSize.setValue(size_pt)
-
-    def _auto_text_size_for_page(self, page: Any) -> int:
-        # A4 = 15 pt.  Other sheets scale by linear paper-size ratio
-        # (sqrt of page area), so A3 ~= 21 pt, A2 ~= 30 pt, A1 ~= 42 pt, A0 ~= 60 pt.
-        a4_area_pt2 = (210.0 * PDF_POINTS_PER_INCH / MM_PER_INCH) * (
-            297.0 * PDF_POINTS_PER_INCH / MM_PER_INCH
-        )
-        page_area_pt2 = max(1.0, float(page.rect.width) * float(page.rect.height))
-        scale = math.sqrt(page_area_pt2 / a4_area_pt2)
-        size = int(round(self.a4_text_size_pt * scale))
-        return max(self.min_auto_text_size_pt, min(self.max_auto_text_size_pt, size))
-
-    @staticmethod
-    def _text_box_min_size(font_size_pt: int | float) -> Tuple[float, float]:
-        font_size = max(1.0, float(font_size_pt))
-        return max(60.0, font_size * 7.0), max(18.0, font_size * 1.8)
 
     def _update_status_bar(self) -> None:
         if self.document is None:
