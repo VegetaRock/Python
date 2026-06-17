@@ -60,7 +60,6 @@ from PySide6.QtGui import (
     QPen,
     QPixmap,
     QTransform,
-    QTextCursor,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -84,7 +83,7 @@ from ui_pdfEditor import Ui_MainWindow
 
 try:
     from watermark import add_watermark
-except ImportError:  # Allow editor to run before user provides watermark.py.
+except Exception:  # keeps editor usable when watermark.py is not present yet
     add_watermark = None  # type: ignore[assignment]
 
 
@@ -199,61 +198,73 @@ class ArrowGraphicsItem(QGraphicsPathItem):
         self.setPath(path)
 
 
-
 # ---------------------------------------------------------------------------
 # EditableTextItem
 # ---------------------------------------------------------------------------
 
 class EditableTextItem(QGraphicsTextItem):
-    """Text annotation item that can be edited directly on the PDF page."""
+    """QGraphicsTextItem with an editing box and safe empty-text cleanup."""
 
-    def __init__(
-        self,
-        editor: "PdfCorrectionEditor",
-        text: str = "",
-        parent: Optional[QGraphicsItem] = None,
-    ) -> None:
-        super().__init__(text, parent)
+    def __init__(self, editor: "PdfCorrectionEditor", text: str = "") -> None:
+        super().__init__(text)
         self.editor = editor
-        self.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
-        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsFocusable, True)
+        self._editing = False
 
-    def start_editing(self, *, select_all: bool = False) -> None:
+    def begin_edit(self, *, select_all: bool = False) -> None:
+        self._editing = True
         self.setTextInteractionFlags(Qt.TextInteractionFlag.TextEditorInteraction)
-        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsFocusable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+        self.setSelected(True)
         self.setFocus(Qt.FocusReason.MouseFocusReason)
         cursor = self.textCursor()
         if select_all:
-            cursor.select(QTextCursor.SelectionType.Document)
+            cursor.select(cursor.SelectionType.Document)
         else:
-            cursor.movePosition(QTextCursor.MoveOperation.End)
+            cursor.movePosition(cursor.MoveOperation.End)
         self.setTextCursor(cursor)
+        self.update()
+
+    def finish_edit(self, *, remove_empty: bool = True) -> None:
+        was_editing = self._editing
+        self._editing = False
+        self.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+        if remove_empty and not self.toPlainText().strip():
+            self.editor.remove_annotation_item(self, remove_from_undo=True)
+            return
+        if was_editing:
+            self.setSelected(False)
+        self.update()
+
+    def is_editing(self) -> bool:
+        return self._editing
 
     def focusOutEvent(self, event) -> None:  # type: ignore[override]
         super().focusOutEvent(event)
-        self.editor.finish_text_edit(self)
+        self.finish_edit(remove_empty=True)
+
+    def mouseDoubleClickEvent(self, event) -> None:  # type: ignore[override]
+        self.editor.begin_text_edit(self, select_all=False)
+        event.accept()
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
         if event.key() == Qt.Key.Key_Escape:
-            self.editor.finish_text_edit(self, unselect_tool=True)
+            self.editor.finish_current_text_edit(remove_empty=True)
+            self.editor.set_tool(None)
             event.accept()
             return
         super().keyPressEvent(event)
         self.update()
 
-    def mouseDoubleClickEvent(self, event) -> None:  # type: ignore[override]
-        self.editor.start_text_edit(self, select_all=False)
-        super().mouseDoubleClickEvent(event)
-
-    def paint(self, painter, option, widget=None) -> None:  # type: ignore[override]
+    def paint(self, painter: QPainter, option, widget=None) -> None:  # type: ignore[override]
         super().paint(painter, option, widget)
-        if self.hasFocus() or not self.toPlainText().strip():
-            pen = QPen(self.editor.annotation_qcolor, 0.0)
-            pen.setCosmetic(True)
-            pen.setStyle(Qt.PenStyle.DashLine)
+        if self._editing or self.isSelected():
+            pen = QPen(QColor("#1f6feb"), 0.0)
+            pen.setStyle(Qt.PenStyle.DashLine if self._editing else Qt.PenStyle.SolidLine)
             painter.setPen(pen)
-            painter.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(self.boundingRect().adjusted(0.5, 0.5, -0.5, -0.5))
+
 
 # ---------------------------------------------------------------------------
 # PdfGraphicsView
@@ -282,9 +293,6 @@ class PdfGraphicsView(QGraphicsView):
         self._pan_h_value = 0
         self._pan_v_value = 0
 
-        # Do not enable SmoothPixmapTransform for PDF tiles. For engineering
-        # drawings at fit-to-page it can soften thin CAD linework. Tiles are
-        # rendered at screen-matched resolution instead.
         self.setRenderHints(
             QPainter.RenderHint.Antialiasing
             | QPainter.RenderHint.TextAntialiasing
@@ -427,15 +435,14 @@ class PdfGraphicsView(QGraphicsView):
     # ------------------------------------------------------------------
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
-        # When a text item is being edited, let QGraphicsTextItem receive
-        # normal editing keys. This is what makes Backspace/Delete clear text
-        # instead of deleting the whole annotation. Escape still finishes text
-        # editing and unselects the active tool.
-        if self.editor.is_text_editing_active():
+        if self.editor.is_text_item_being_edited():
             if event.key() == Qt.Key.Key_Escape:
-                self.editor.finish_current_text_edit(unselect_tool=True)
+                self.editor.finish_current_text_edit(remove_empty=True)
+                self.editor.set_tool(None)
                 event.accept()
                 return
+            # Backspace/Delete/Ctrl+Z must go to the active text box, not to
+            # annotation delete/undo.
             super().keyPressEvent(event)
             return
 
@@ -448,7 +455,7 @@ class PdfGraphicsView(QGraphicsView):
             event.accept()
             return
         if event.key() == Qt.Key.Key_Escape:
-            self.editor.finish_current_text_edit(unselect_tool=True)
+            self.editor.finish_current_text_edit(remove_empty=True)
             self.editor.set_tool(None)
             event.accept()
             return
@@ -528,11 +535,9 @@ class PdfCorrectionEditor(QMainWindow):
     """
 
     correction_saved = Signal(str)
-    # Emitted after the watermark operation finishes successfully. Kept for
-    # simple main.py callbacks that do not need arguments.
+    correction_completed = Signal(str, str)  # correction_pdf_path, deleted_source_pdf_path
     approve_requested = Signal()
-    # Emitted after approval with: source_pdf_path, correction_pdf_path.
-    approve_completed = Signal(str, str)
+    approve_completed = Signal(str, str)  # watermarked_source_pdf_path, correction_pdf_path
     cancel_requested = Signal()
 
     def __init__(
@@ -551,7 +556,7 @@ class PdfCorrectionEditor(QMainWindow):
         max_zoom: float = 32.0,
         annotation_width_pt: float = 1.5,
         annotation_color: str = "#ff0000",
-        default_text_size_pt: int = 12,
+        default_text_size_pt: int = 15,
         screen_matched_rendering: bool = True,
         graphics_min_line_width_px: float = 1.0,
         auto_text_size_by_paper: bool = True,
@@ -586,20 +591,6 @@ class PdfCorrectionEditor(QMainWindow):
         self.tile_pixel_size = max(256, int(tile_pixel_size))
         self.min_zoom = float(min_zoom)
         self.max_zoom = float(max_zoom)
-        self.screen_matched_rendering = bool(screen_matched_rendering)
-        self.graphics_min_line_width_px = float(graphics_min_line_width_px)
-        self.auto_text_size_by_paper = bool(auto_text_size_by_paper)
-        self.base_text_size_a4_pt = float(base_text_size_a4_pt)
-        self.min_auto_text_size_pt = int(min_auto_text_size_pt)
-        self.max_auto_text_size_pt = int(max_auto_text_size_pt)
-
-        # MuPDF thin-line enhancement. This makes fit-to-page engineering
-        # drawings look closer to Acrobat because very thin vector lines are
-        # kept visible instead of fading below one screen pixel.
-        try:
-            fitz.TOOLS.set_graphics_min_line_width(self.graphics_min_line_width_px)
-        except Exception:
-            pass
 
         # ── Runtime state ──────────────────────────────────────────────────
         self.current_zoom: float = 1.0
@@ -608,6 +599,17 @@ class PdfCorrectionEditor(QMainWindow):
         self.annotation_qcolor = QColor(annotation_color)
         self.annotation_rgb = self._qcolor_to_pymupdf_rgb(self.annotation_qcolor)
         self.default_text_size_pt = int(default_text_size_pt)
+        self.screen_matched_rendering = bool(screen_matched_rendering)
+        self.graphics_min_line_width_px = max(0.0, float(graphics_min_line_width_px))
+        self.auto_text_size_by_paper = bool(auto_text_size_by_paper)
+        self.base_text_size_a4_pt = float(base_text_size_a4_pt)
+        self.min_auto_text_size_pt = int(min_auto_text_size_pt)
+        self.max_auto_text_size_pt = int(max_auto_text_size_pt)
+        if hasattr(fitz, "TOOLS") and hasattr(fitz.TOOLS, "set_graphics_min_line_width"):
+            try:
+                fitz.TOOLS.set_graphics_min_line_width(self.graphics_min_line_width_px)
+            except Exception:
+                pass
 
         self.document: Optional[Any] = None
         self.current_page_index: int = 0
@@ -616,7 +618,6 @@ class PdfCorrectionEditor(QMainWindow):
         self._fit_mode: bool = True
         self._next_annotation_id: int = 1
         self._updating_page_spinbox: bool = False
-        self._finalizing_text_item: bool = False
 
         self.annotations_by_page: Dict[int, List[Dict[str, Any]]] = {}
         self.undo_stack: List[Tuple[int, int]] = []  # (page_index, annotation_id)
@@ -729,13 +730,9 @@ class PdfCorrectionEditor(QMainWindow):
         if hasattr(self.ui, "btnText"):
             self.ui.btnText.clicked.connect(_tool_toggle(KIND_TEXT))
         if hasattr(self.ui, "btnCorrection"):
-            self.ui.btnCorrection.clicked.connect(
-                lambda checked=False: self.save_correction(show_message=True)
-            )
+            self.ui.btnCorrection.clicked.connect(self.on_correction_clicked)
         if hasattr(self.ui, "btnAppr"):
-            self.ui.btnAppr.clicked.connect(
-                lambda checked=False: self.approve_pdf()
-            )
+            self.ui.btnAppr.clicked.connect(self.on_approve_clicked)
         if hasattr(self.ui, "btnCancel"):
             self.ui.btnCancel.clicked.connect(self.cancel_requested.emit)
         if hasattr(self.ui, "spinBoxPageNo"):
@@ -743,8 +740,6 @@ class PdfCorrectionEditor(QMainWindow):
 
     def _create_shortcuts(self) -> None:
         shortcuts: List[Tuple[str | QKeySequence.StandardKey, Any]] = [
-            (QKeySequence.StandardKey.Undo, self.undo_last_draw),
-            (QKeySequence("Delete"), self.delete_selected_annotations),
             (QKeySequence.StandardKey.ZoomIn, lambda: self.zoom_at_view_center(1.15)),
             (
                 QKeySequence.StandardKey.ZoomOut,
@@ -809,14 +804,21 @@ class PdfCorrectionEditor(QMainWindow):
             pass
         return target
 
-    def save_correction(self, *, show_message: bool = True) -> Optional[Path]:
+    def save_correction(self, show_message: bool = True) -> Optional[Path]:
         if self.document is None:
-            QMessageBox.warning(self, "No PDF loaded", "Please open a PDF first.")
+            if show_message:
+                QMessageBox.warning(self, "No PDF loaded", "Please open a PDF first.")
             return None
 
-        self.finish_current_text_edit(unselect_tool=False)
+        self.finish_current_text_edit(remove_empty=True)
         self.collect_current_page_annotations()
         target = self.output_path
+        try:
+            if target.resolve() == self.input_path.resolve():
+                target = target.with_name(f"{target.stem}_annotated.pdf")
+                self.output_path = target
+        except Exception:
+            pass
         target.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = target.with_name(f".{target.stem}.tmp{target.suffix}")
 
@@ -840,12 +842,15 @@ class PdfCorrectionEditor(QMainWindow):
                     tmp_path.unlink()
             except Exception:
                 pass
-            QMessageBox.critical(
-                self, "Save failed", f"Could not save annotated PDF:\n{exc}"
-            )
+            if show_message:
+                QMessageBox.critical(
+                    self, "Save failed", f"Could not save annotated PDF:\n{exc}"
+                )
+            else:
+                self.statusBar().showMessage(f"Save failed: {exc}", 8000)
             return None
 
-        self.statusBar().showMessage(f"Saved correction: {target}", 8000)
+        self.statusBar().showMessage(f"Saved: {target}", 8000)
         self.correction_saved.emit(str(target))
         if show_message:
             QMessageBox.information(
@@ -853,90 +858,132 @@ class PdfCorrectionEditor(QMainWindow):
             )
         return target
 
-    def approve_pdf(self) -> None:
+    def on_correction_clicked(self) -> None:
         """
-        Approve workflow:
-          1. Save the correction/annotation PDF to ``self.output_path``.
-          2. Apply watermark to the existing input PDF path in-place.
-          3. Reopen that same input PDF so the user sees the watermarked file.
-          4. Emit signals so main.py can continue its own workflow.
+        Save the correction PDF to output_path, delete the original/source PDF,
+        reopen the saved correction PDF, and notify the host app through
+        correction_completed.
         """
+        source_path = Path(self.input_path)
+        correction_path = self.save_correction(show_message=False)
+        if correction_path is None:
+            QMessageBox.warning(self, "Correction failed", "Could not save correction PDF.")
+            return
+
+        deleted_source = ""
+        delete_error = ""
+        try:
+            same_file = source_path.resolve() == correction_path.resolve()
+        except Exception:
+            same_file = False
+
+        if not same_file and source_path.exists():
+            # On Windows the file cannot be deleted while PyMuPDF still has it open.
+            self._close_current_document()
+            try:
+                source_path.unlink()
+                deleted_source = str(source_path)
+            except Exception as exc:  # noqa: BLE001
+                delete_error = str(exc)
+
+        # After deleting the source, keep the viewer usable by opening the
+        # saved correction PDF.
+        try:
+            self.load_pdf(correction_path)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(
+                self,
+                "Correction saved",
+                f"Correction saved to:\n{correction_path}\n\n"
+                f"Could not reopen it:\n{exc}",
+            )
+
+        self.correction_completed.emit(str(correction_path), deleted_source)
+
+        if delete_error:
+            QMessageBox.warning(
+                self,
+                "Correction saved",
+                f"Correction saved to:\n{correction_path}\n\n"
+                f"Source PDF could not be deleted:\n{source_path}\n\n{delete_error}",
+            )
+        else:
+            msg = f"Correction saved to:\n{correction_path}"
+            if deleted_source:
+                msg += f"\n\nSource PDF deleted:\n{deleted_source}"
+            QMessageBox.information(self, "Correction completed", msg)
+
+    def on_approve_clicked(self) -> None:
+        """
+        Save the correction PDF separately, watermark the existing/source PDF in
+        the same location, reopen that source PDF, then notify the host app.
+        """
+        source_path = Path(self.input_path)
+        correction_path = self.save_correction(show_message=False)
+        if correction_path is None:
+            QMessageBox.warning(self, "Approve failed", "Could not save correction PDF.")
+            return
+
         if add_watermark is None:
             QMessageBox.critical(
                 self,
-                "Watermark module missing",
-                "Could not import add_watermark from watermark.py.\n\n"
-                "Place watermark.py beside pdf_editor_controller.py or add it to PYTHONPATH.",
+                "Watermark unavailable",
+                "Could not import add_watermark from watermark.py.\n"
+                "Place watermark.py beside pdf_editor_controller.py or in PYTHONPATH.",
             )
             return
 
-        correction_path = self.save_correction(show_message=False)
-        if correction_path is None:
-            return
-
-        source_pdf_path = self.input_path
-        page_to_restore = self.current_page_index
-
-        # Close the document before watermarking the same physical file. This is
-        # important on Windows and avoids file-lock/native-save problems.
-        self._tile_timer.stop()
-        self._clear_tile_cache()
-        if self.document is not None:
-            try:
-                self.document.close()
-            finally:
-                self.document = None
-
+        self._close_current_document()
         try:
-            result = add_watermark(str(source_pdf_path), "ABC")
-
-            # If the user's watermark function returns another PDF path, replace
-            # the original with it so watermark is still saved at the same
-            # existing PDF path, as requested.
-            if isinstance(result, (str, os.PathLike)) and result:
-                returned_path = Path(result).expanduser().resolve()
-                if returned_path.exists() and returned_path != source_pdf_path:
-                    tmp_same_folder = source_pdf_path.with_name(
-                        f".{source_pdf_path.stem}.watermark_replace{source_pdf_path.suffix}"
-                    )
-                    os.replace(str(returned_path), str(tmp_same_folder))
-                    os.replace(str(tmp_same_folder), str(source_pdf_path))
-
+            add_watermark(str(source_path), "ABC")
         except Exception as exc:  # noqa: BLE001
-            # Try to reopen the original PDF even if watermarking fails.
             try:
-                self.reopen_pdf(source_pdf_path, page_index=page_to_restore)
+                if source_path.exists():
+                    self.load_pdf(source_path)
             except Exception:
                 pass
             QMessageBox.critical(
                 self,
                 "Approve failed",
-                f"Correction was saved, but watermarking failed:\n{exc}",
+                f"Correction was saved to:\n{correction_path}\n\n"
+                f"Watermark failed for:\n{source_path}\n\n{exc}",
             )
             return
 
-        self.reopen_pdf(source_pdf_path, page_index=page_to_restore)
-        self.statusBar().showMessage(
-            f"Approved. Watermarked source PDF: {source_pdf_path}", 8000
-        )
+        try:
+            self.load_pdf(source_path)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(
+                self,
+                "Approve completed",
+                f"Watermark completed for:\n{source_path}\n\n"
+                f"Correction saved to:\n{correction_path}\n\n"
+                f"Could not reopen PDF:\n{exc}",
+            )
 
-        # Trigger callbacks in main.py only after watermark + reopen completes.
         self.approve_requested.emit()
-        self.approve_completed.emit(str(source_pdf_path), str(correction_path))
+        self.approve_completed.emit(str(source_path), str(correction_path))
+        self.statusBar().showMessage(f"Approved and watermarked: {source_path}", 8000)
 
-    def reopen_pdf(
-        self,
-        path: str | os.PathLike[str] | None = None,
-        *,
-        page_index: Optional[int] = None,
-    ) -> None:
-        """Reload a PDF from disk and show it again in the editor."""
-        target = Path(path).expanduser().resolve() if path is not None else self.input_path
-        restore_page = self.current_page_index if page_index is None else int(page_index)
-        self.load_pdf(target)
-        if self.document is not None and 0 <= restore_page < self.document.page_count:
-            self.current_page_index = restore_page
-            self.render_current_page(fit_after_render=True)
+    def _close_current_document(self) -> None:
+        """Close the currently opened PDF file handle without closing the window."""
+        self._tile_timer.stop()
+        self._clear_tile_cache()
+        for item in list(self._tile_items):
+            if item.scene() is self.scene:
+                self.scene.removeItem(item)
+        self._tile_items.clear()
+        if self.document is not None:
+            try:
+                self.document.close()
+            except Exception:
+                pass
+            self.document = None
+
+    def reopen_pdf(self, path: str | os.PathLike[str]) -> None:
+        """Public helper for host apps that need to reload the displayed PDF."""
+        self._close_current_document()
+        self.load_pdf(path)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._tile_timer.stop()
@@ -1038,6 +1085,8 @@ class PdfCorrectionEditor(QMainWindow):
                     )
                     tile_item.setTransformationMode(
                         Qt.TransformationMode.FastTransformation
+                        if self.screen_matched_rendering
+                        else Qt.TransformationMode.SmoothTransformation
                     )
                     tile_item.setZValue(-100)
                     tile_item.setPos(clip.left(), clip.top())
@@ -1073,25 +1122,23 @@ class PdfCorrectionEditor(QMainWindow):
 
     def _choose_render_dpi(self) -> float:
         """
-        Choose a render DPI for the current visible viewport.
+        Compute tile render DPI.
 
-        In screen-matched mode (default), the tile is rendered so one PDF-rendered
-        pixel maps to roughly one screen pixel. This avoids the soft/pale linework
-        caused by rendering an A0 page at very high DPI and then shrinking it into
-        the QGraphicsView. ``graphics_min_line_width_px`` keeps sub-pixel CAD
-        lines visible, similar to Acrobat's thin-line enhancement.
+        In screen-matched mode the rendered pixels are matched to the current
+        viewport pixels, like Acrobat-style fit-page display.  This avoids the
+        blurry/pale result caused by rendering A0 at a very high DPI and then
+        letting Qt downscale it into the GraphicsView.
         """
         vp_rect = self.view.viewport().rect()
         visible_scene = self.view.mapToScene(vp_rect).boundingRect().intersected(
             self.page_scene_rect
         )
         if visible_scene.isNull() or visible_scene.width() <= 0 or visible_scene.height() <= 0:
-            return max(1.0, self.minimum_render_dpi)
+            return max(12.0, min(self.maximum_render_dpi, self.minimum_render_dpi))
 
         visible_vp = self.view.mapFromScene(visible_scene).boundingRect()
         vp_px_w = max(1.0, float(visible_vp.width()))
         vp_px_h = max(1.0, float(visible_vp.height()))
-
         page_in_w = max(0.001, visible_scene.width() / PDF_POINTS_PER_INCH)
         page_in_h = max(0.001, visible_scene.height() / PDF_POINTS_PER_INCH)
         dpi_x = vp_px_w / page_in_w
@@ -1100,24 +1147,18 @@ class PdfCorrectionEditor(QMainWindow):
         dpr = self._device_pixel_ratio()
 
         if self.screen_matched_rendering:
-            target = screen_dpi * dpr * max(0.1, self.render_quality)
+            # Ignore old high minimum_render_dpi/render_quality values in this
+            # mode; high-DPI render + downscale is exactly what made A0 linework
+            # look soft. Keep only a small 24-DPI safety floor for fit-page.
+            # Thin-line visibility is handled by MuPDF below.
+            target = screen_dpi * dpr
+            lower_bound = min(max(12.0, self.minimum_render_dpi), 24.0)
         else:
-            target = screen_dpi * dpr * max(0.1, self.render_quality)
-            target = max(self.minimum_render_dpi, target)
+            target = screen_dpi * max(1.0, self.render_quality) * dpr
+            lower_bound = max(12.0, self.minimum_render_dpi)
 
-        # Pixel-count guard is based on the visible rect, not the whole A0 sheet.
-        # This allows zoomed-in details to render sharply without allocating a
-        # full-page bitmap.
-        visible_pixels_at_target = page_in_w * page_in_h * target * target
-        if visible_pixels_at_target > self.max_visible_render_pixels:
-            target *= math.sqrt(self.max_visible_render_pixels / visible_pixels_at_target)
-
-        lower = max(1.0, self.minimum_render_dpi)
-        if self.screen_matched_rendering:
-            # Keep a very low floor for fit-page A0. High floors force a large
-            # bitmap that Qt must shrink, which makes CAD lines look worse.
-            lower = max(4.0, min(lower, 24.0))
-        return max(lower, min(self.maximum_render_dpi, target))
+        target = max(lower_bound, min(self.maximum_render_dpi, target))
+        return float(target)
 
     def _device_pixel_ratio(self) -> float:
         """Return the device pixel ratio of the screen that hosts the window."""
@@ -1164,6 +1205,12 @@ class PdfCorrectionEditor(QMainWindow):
             float(rect.right()),
             float(rect.bottom()),
         )
+        if self.screen_matched_rendering and hasattr(fitz, "TOOLS") and hasattr(fitz.TOOLS, "set_graphics_min_line_width"):
+            try:
+                fitz.TOOLS.set_graphics_min_line_width(self.graphics_min_line_width_px)
+            except Exception:
+                pass
+
         # annots=False: existing PDF annotations are not rendered into tiles
         # because we draw them ourselves as QGraphicsItems.
         pix = page.get_pixmap(
@@ -1213,6 +1260,7 @@ class PdfCorrectionEditor(QMainWindow):
             return
         if page_index == self.current_page_index:
             return
+        self.finish_current_text_edit(remove_empty=True)
         self.collect_current_page_annotations()
         self.current_page_index = page_index
         self._clear_tile_cache()
@@ -1278,25 +1326,6 @@ class PdfCorrectionEditor(QMainWindow):
         self.current_zoom = new_zoom
         self.schedule_tile_update(20)
         self._update_status_bar()
-
-    # ======================================================================
-    # Text-size helpers
-    # ======================================================================
-
-    def _update_auto_text_size_for_page(self, page: Any) -> None:
-        if not self.auto_text_size_by_paper or not hasattr(self.ui, "spinBoxTextSize"):
-            return
-        size = self._auto_text_size_for_page(page)
-        self.ui.spinBoxTextSize.setValue(size)
-
-    def _auto_text_size_for_page(self, page: Any) -> int:
-        page_area_pt = max(1.0, float(page.rect.width) * float(page.rect.height))
-        a4_w_pt = 210.0 * PDF_POINTS_PER_INCH / MM_PER_INCH
-        a4_h_pt = 297.0 * PDF_POINTS_PER_INCH / MM_PER_INCH
-        a4_area_pt = a4_w_pt * a4_h_pt
-        scale = math.sqrt(page_area_pt / a4_area_pt)
-        size = int(round(self.base_text_size_a4_pt * scale))
-        return max(self.min_auto_text_size_pt, min(self.max_auto_text_size_pt, size))
 
     # ======================================================================
     # Tool management
@@ -1389,103 +1418,63 @@ class PdfCorrectionEditor(QMainWindow):
     def add_text_at(
         self,
         scene_pos: QPointF,
-        text: Optional[str] = None,
-    ) -> Optional[QGraphicsTextItem]:
-        """Create an editable text box exactly at the clicked page position."""
+        text: str = "",
+    ) -> Optional[EditableTextItem]:
+        """Create an editable text box at the exact clicked PDF location."""
         font_size_pt = (
             max(1, self.ui.spinBoxTextSize.value())
             if hasattr(self.ui, "spinBoxTextSize")
             else self.default_text_size_pt
         )
-
-        initial_text = "" if text is None else str(text)
-        if text is not None and not initial_text.strip():
-            return None
-
-        item = self.create_text_item(initial_text, int(font_size_pt))
-        item.setPos(self.clamp_to_page(scene_pos))
-        self.scene.addItem(item)
-        self.register_new_annotation(item)
-
-        # For user-created text, enter direct edit mode immediately. The dashed
-        # text box appears at the mouse click and Backspace/Delete edit text.
-        if text is None:
-            self.start_text_edit(item, select_all=False)
-        return item
-
-    def create_text_item(
-        self,
-        text: str,
-        font_size_pt: int,
-        annotation_id: Optional[int] = None,
-    ) -> EditableTextItem:
         item = EditableTextItem(self, text)
         font = QFont("Arial")
         font.setPointSizeF(max(1.0, float(font_size_pt)))
         item.setFont(font)
         item.setDefaultTextColor(self.annotation_qcolor)
-        # A finite width makes an actual text box visible where the user clicks.
-        # It scales with font size so A0 text boxes are not too narrow.
-        item.setTextWidth(max(180.0, float(font_size_pt) * 18.0))
-        self._configure_annotation_item(item, KIND_TEXT, annotation_id)
+        # Give an empty text item a visible/editable box.  Width is in PDF pt
+        # and scales naturally with page size.
+        page_w = max(1.0, self.page_scene_rect.width())
+        item.setTextWidth(max(float(font_size_pt) * 10.0, min(page_w * 0.28, 500.0)))
+        item.setPos(self.clamp_to_page(scene_pos))
+        self._configure_annotation_item(item, KIND_TEXT)
         item.setData(FONT_SIZE_PT_ROLE, int(font_size_pt))
+        self.scene.addItem(item)
+        self.register_new_annotation(item)
+        self.begin_text_edit(item, select_all=False)
         return item
 
-    def start_text_edit(
-        self,
-        item: QGraphicsTextItem,
-        *,
-        select_all: bool = False,
-    ) -> None:
+    def begin_text_edit(self, item: QGraphicsTextItem, *, select_all: bool = False) -> None:
+        """Start direct editing for a text annotation."""
         if not isinstance(item, EditableTextItem):
             return
-        self.scene.clearSelection()
-        item.setSelected(True)
-        item.start_editing(select_all=select_all)
+        item.begin_edit(select_all=select_all)
 
-    def is_text_editing_active(self) -> bool:
-        item = self.scene.focusItem() if self.scene is not None else None
-        return (
-            isinstance(item, QGraphicsTextItem)
-            and item.data(ITEM_KIND_ROLE) == KIND_TEXT
-            and bool(item.textInteractionFlags() & Qt.TextInteractionFlag.TextEditorInteraction)
+    def finish_current_text_edit(self, *, remove_empty: bool = True) -> None:
+        focus_item = self.scene.focusItem() if self.scene is not None else None
+        if isinstance(focus_item, EditableTextItem):
+            focus_item.finish_edit(remove_empty=remove_empty)
+            return
+        for item in self.scene.items():
+            if isinstance(item, EditableTextItem) and item.is_editing():
+                item.finish_edit(remove_empty=remove_empty)
+
+    def is_text_item_being_edited(self) -> bool:
+        focus_item = self.scene.focusItem() if self.scene is not None else None
+        if isinstance(focus_item, EditableTextItem) and focus_item.is_editing():
+            return True
+        return any(
+            isinstance(item, EditableTextItem) and item.is_editing()
+            for item in self.scene.items()
         )
 
-    def finish_current_text_edit(self, *, unselect_tool: bool = False) -> None:
-        item = self.scene.focusItem() if self.scene is not None else None
-        if isinstance(item, QGraphicsTextItem) and item.data(ITEM_KIND_ROLE) == KIND_TEXT:
-            self.finish_text_edit(item, unselect_tool=unselect_tool)
-        if unselect_tool:
-            self.set_tool(None)
-
-    def finish_text_edit(
-        self,
-        item: QGraphicsTextItem,
-        *,
-        unselect_tool: bool = False,
+    def remove_annotation_item(
+        self, item: QGraphicsItem, *, remove_from_undo: bool = True
     ) -> None:
-        if self._finalizing_text_item:
-            return
-        self._finalizing_text_item = True
-        try:
-            item.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
-            if item.hasFocus():
-                item.clearFocus()
-
-            # Remove empty text boxes automatically.
-            if not item.toPlainText().strip():
-                aid = int(item.data(ANNOTATION_ID_ROLE) or 0)
-                if item.scene() is self.scene:
-                    self.scene.removeItem(item)
-                self.undo_stack = [entry for entry in self.undo_stack if entry[1] != aid]
-            else:
-                item.update()
-        finally:
-            self._finalizing_text_item = False
-
-        if unselect_tool:
-            self.set_tool(None)
-        self._update_status_bar()
+        aid = int(item.data(ANNOTATION_ID_ROLE) or 0)
+        if item.scene() is self.scene:
+            self.scene.removeItem(item)
+        if remove_from_undo and aid > 0:
+            self.undo_stack = [entry for entry in self.undo_stack if entry[1] != aid]
 
     def _configure_annotation_item(
         self,
@@ -1497,14 +1486,11 @@ class PdfCorrectionEditor(QMainWindow):
             annotation_id = self._take_next_annotation_id()
         item.setData(ITEM_KIND_ROLE, kind)
         item.setData(ANNOTATION_ID_ROLE, int(annotation_id))
-        flags = (
+        item.setFlags(
             QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
             | QGraphicsItem.GraphicsItemFlag.ItemIsMovable
             | QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges
         )
-        if kind == KIND_TEXT:
-            flags |= QGraphicsItem.GraphicsItemFlag.ItemIsFocusable
-        item.setFlags(flags)
         item.setZValue(50)
 
     def _take_next_annotation_id(self) -> int:
@@ -1523,6 +1509,16 @@ class PdfCorrectionEditor(QMainWindow):
             item.setData(ANNOTATION_ID_ROLE, aid)
         self.undo_stack.append((self.current_page_index, aid))
         self._update_status_bar()
+
+    def undo_last_draw_from_shortcut(self) -> None:
+        if self.is_text_item_being_edited():
+            return
+        self.undo_last_draw()
+
+    def delete_selected_annotations_from_shortcut(self) -> None:
+        if self.is_text_item_being_edited():
+            return
+        self.delete_selected_annotations()
 
     def undo_last_draw(self) -> None:
         if not self.undo_stack:
@@ -1714,12 +1710,17 @@ class PdfCorrectionEditor(QMainWindow):
             elif kind == KIND_TEXT:
                 x, y = mark["pos"]
                 font_size = int(mark.get("font_size_pt", self.default_text_size_pt))
-                item = self.create_text_item(
-                    str(mark.get("text", "")),
-                    font_size,
-                    annotation_id=aid,
-                )
+                item = EditableTextItem(self, str(mark.get("text", "")))
+                font = QFont("Arial")
+                font.setPointSizeF(max(1.0, float(font_size)))
+                item.setFont(font)
+                item.setDefaultTextColor(self.annotation_qcolor)
+                page_w = max(1.0, self.page_scene_rect.width())
+                item.setTextWidth(max(float(font_size) * 10.0, min(page_w * 0.28, 500.0)))
+                item.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
                 item.setPos(QPointF(float(x), float(y)))
+                self._configure_annotation_item(item, KIND_TEXT, annotation_id=aid)
+                item.setData(FONT_SIZE_PT_ROLE, font_size)
                 self.scene.addItem(item)
 
         self._next_annotation_id = max(self._next_annotation_id, max_id + 1)
@@ -1838,6 +1839,24 @@ class PdfCorrectionEditor(QMainWindow):
             except Exception:
                 pass
         return p
+
+    def _update_auto_text_size_for_page(self, page: Any) -> None:
+        if not self.auto_text_size_by_paper or not hasattr(self.ui, "spinBoxTextSize"):
+            return
+        size = self._auto_text_size_for_page(page)
+        self.ui.spinBoxTextSize.blockSignals(True)
+        self.ui.spinBoxTextSize.setValue(size)
+        self.ui.spinBoxTextSize.blockSignals(False)
+        self.default_text_size_pt = size
+
+    def _auto_text_size_for_page(self, page: Any) -> int:
+        w_mm = float(page.rect.width) * MM_PER_INCH / PDF_POINTS_PER_INCH
+        h_mm = float(page.rect.height) * MM_PER_INCH / PDF_POINTS_PER_INCH
+        a4_area = 210.0 * 297.0
+        area = max(1.0, w_mm * h_mm)
+        scale = math.sqrt(area / a4_area)
+        value = int(round(self.base_text_size_a4_pt * scale))
+        return max(self.min_auto_text_size_pt, min(self.max_auto_text_size_pt, value))
 
     # ======================================================================
     # Page geometry & status bar
