@@ -1,0 +1,533 @@
+"""
+OpenFilesLogger starter agent for Windows.
+
+It reads Windows Security Event Log event ID 4663, filters file access events,
+and can either:
+
+1. Preview them locally without PostgreSQL.
+2. Write them to a local JSONL file without PostgreSQL.
+3. Insert metadata into PostgreSQL.
+
+Run in an elevated terminal because reading the Security log usually requires
+administrator privileges.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path, PureWindowsPath
+from typing import Any, Iterable
+
+try:
+    import psycopg  # type: ignore[import-not-found]
+except ImportError:  # PostgreSQL is optional for preview/log-local modes.
+    psycopg = None  # type: ignore[assignment]
+
+SOURCE = "windows-security-4663"
+
+OFFICE_EXTENSIONS = {
+    ".doc", ".docx", ".docm", ".dot", ".dotx", ".dotm",
+    ".xls", ".xlsx", ".xlsm", ".xlsb", ".xlt", ".xltx", ".xltm",
+    ".ppt", ".pptx", ".pptm", ".pot", ".potx", ".potm",
+    ".odt", ".ods", ".odp", ".rtf", ".csv",
+}
+
+PDF_EXTENSIONS = {".pdf"}
+
+CAD_EXTENSIONS = {
+    ".dwg", ".dxf", ".dwt", ".dgn",
+    ".rvt", ".rfa", ".ifc",
+    ".step", ".stp", ".iges", ".igs",
+    ".stl", ".obj", ".3dm", ".skp",
+    ".sldprt", ".sldasm", ".slddrw",
+    ".ipt", ".iam", ".idw",
+    ".prt", ".asm", ".catpart", ".catproduct",
+    ".f3d",
+}
+
+DOCUMENT_EXTENSIONS = OFFICE_EXTENSIONS | PDF_EXTENSIONS | CAD_EXTENSIONS
+
+SYSTEM_PATH_PREFIXES = (
+    "c:\\windows\\",
+    "c:\\program files\\",
+    "c:\\program files (x86)\\",
+    "c:\\programdata\\microsoft\\windows defender\\",
+)
+
+DB_COMMANDS = {"init-db", "run-once", "run"}
+LOCAL_COMMANDS = {"preview", "dry-run", "watch-preview", "log-local"}
+ALL_COMMANDS = sorted(DB_COMMANDS | LOCAL_COMMANDS)
+
+
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_config() -> dict[str, Any]:
+    return {
+        "dsn": os.getenv("FILE_LOGGER_PG_DSN", "postgresql://file_logger:change-me@localhost:5432/filelogger"),
+        "mode": os.getenv("FILE_LOGGER_MODE", "documents").strip().lower(),  # documents or all
+        "poll_seconds": int(os.getenv("FILE_LOGGER_POLL_SECONDS", "10")),
+        "lookback_seconds": int(os.getenv("FILE_LOGGER_LOOKBACK_SECONDS", "300")),
+        "ignore_system_paths": env_bool("FILE_LOGGER_IGNORE_SYSTEM_PATHS", True),
+        "local_output": os.getenv("FILE_LOGGER_LOCAL_OUTPUT", "open_file_events.jsonl"),
+        "preview_limit": int(os.getenv("FILE_LOGGER_PREVIEW_LIMIT", "50")),
+    }
+
+
+def category_for_extension(ext: str | None) -> str:
+    if not ext:
+        return "other"
+    ext = ext.lower()
+    if ext in OFFICE_EXTENSIONS:
+        return "office"
+    if ext in PDF_EXTENSIONS:
+        return "pdf"
+    if ext in CAD_EXTENSIONS:
+        return "cad"
+    return "other"
+
+
+def parse_time(value: str | None) -> datetime:
+    if not value:
+        return datetime.now(timezone.utc)
+    # PowerShell emits ISO 8601 with Z or +00:00 depending on version.
+    cleaned = value.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(cleaned)
+    except ValueError:
+        return datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def parse_pid(value: str | None) -> int | None:
+    if not value:
+        return None
+    text = value.strip()
+    try:
+        if text.lower().startswith("0x"):
+            return int(text, 16)
+        return int(text)
+    except ValueError:
+        return None
+
+
+def path_extension(path: str) -> str | None:
+    try:
+        suffix = PureWindowsPath(path).suffix.lower()
+    except Exception:
+        return None
+    return suffix or None
+
+
+def is_temporary_office_file(path: str) -> bool:
+    name = PureWindowsPath(path).name.lower()
+    return name.startswith("~$") or name.endswith(".tmp")
+
+
+def should_keep_event(event: dict[str, Any], mode: str, ignore_system_paths: bool) -> bool:
+    path = (event.get("ObjectName") or "").strip()
+    if not path:
+        return False
+
+    # 4663 can include registry/kernel objects depending on policy; keep file objects only.
+    object_type = (event.get("ObjectType") or "").strip().lower()
+    if object_type and object_type != "file":
+        return False
+
+    lowered = path.lower()
+    if ignore_system_paths and lowered.startswith(SYSTEM_PATH_PREFIXES):
+        return False
+
+    if is_temporary_office_file(path):
+        return False
+
+    ext = path_extension(path)
+    if mode == "all":
+        return True
+    return bool(ext and ext in DOCUMENT_EXTENSIONS)
+
+
+def powershell_4663_json(lookback_seconds: int) -> str:
+    ps = rf'''
+$since = (Get-Date).AddSeconds(-{int(lookback_seconds)})
+$events = Get-WinEvent -FilterHashtable @{{LogName='Security'; Id=4663; StartTime=$since}} -ErrorAction SilentlyContinue
+$result = foreach ($e in $events) {{
+    $x = [xml]$e.ToXml()
+    $data = @{{}}
+    foreach ($d in $x.Event.EventData.Data) {{
+        $data[$d.Name] = [string]$d.'#text'
+    }}
+    [PSCustomObject]@{{
+        RecordId = [int64]$e.RecordId
+        TimeCreatedUtc = $e.TimeCreated.ToUniversalTime().ToString('o')
+        Computer = [string]$e.MachineName
+        SubjectUserName = [string]$data['SubjectUserName']
+        SubjectDomainName = [string]$data['SubjectDomainName']
+        ObjectType = [string]$data['ObjectType']
+        ObjectName = [string]$data['ObjectName']
+        ProcessId = [string]$data['ProcessId']
+        ProcessName = [string]$data['ProcessName']
+        AccessMask = [string]$data['AccessMask']
+        AccessList = [string]$data['AccessList']
+    }}
+}}
+if ($null -eq $result) {{
+    '[]'
+}} else {{
+    $result | ConvertTo-Json -Compress -Depth 4
+}}
+'''
+    completed = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.strip() or completed.stdout.strip())
+    return completed.stdout.strip()
+
+
+def read_windows_events(lookback_seconds: int) -> list[dict[str, Any]]:
+    if sys.platform != "win32":
+        raise RuntimeError("This starter agent reads Windows Security logs and must run on Windows.")
+
+    raw = powershell_4663_json(lookback_seconds)
+    if not raw:
+        return []
+    data = json.loads(raw)
+    if data is None:
+        return []
+    if isinstance(data, dict):
+        return [data]
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    return []
+
+
+def filter_events(events: Iterable[dict[str, Any]], cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    return [e for e in events if should_keep_event(e, cfg["mode"], cfg["ignore_system_paths"])]
+
+
+def event_key(event: dict[str, Any], fallback_host: str) -> tuple[str, str, int]:
+    host = (event.get("Computer") or fallback_host).strip() or fallback_host
+    return (host, SOURCE, int(event.get("RecordId")))
+
+
+def event_to_dict(event: dict[str, Any], fallback_host: str) -> dict[str, Any]:
+    path = (event.get("ObjectName") or "").strip()
+    ext = path_extension(path)
+    host = (event.get("Computer") or fallback_host).strip() or fallback_host
+    event_time = parse_time(event.get("TimeCreatedUtc"))
+    return {
+        "source": SOURCE,
+        "event_record_id": int(event.get("RecordId")),
+        "host": host,
+        "event_time": event_time.isoformat(),
+        "username": event.get("SubjectUserName") or None,
+        "domain": event.get("SubjectDomainName") or None,
+        "process_name": event.get("ProcessName") or None,
+        "process_id": parse_pid(event.get("ProcessId")),
+        "path": path,
+        "extension": ext,
+        "file_category": category_for_extension(ext),
+        "access_mask": event.get("AccessMask") or None,
+        "access_list": event.get("AccessList") or None,
+        "raw_event": event,
+    }
+
+
+def event_to_row(event: dict[str, Any], fallback_host: str) -> tuple[Any, ...]:
+    item = event_to_dict(event, fallback_host)
+    return (
+        item["source"],
+        item["event_record_id"],
+        item["host"],
+        parse_time(event.get("TimeCreatedUtc")),
+        item["username"],
+        item["domain"],
+        item["process_name"],
+        item["process_id"],
+        item["path"],
+        item["extension"],
+        item["file_category"],
+        item["access_mask"],
+        item["access_list"],
+        json.dumps(event, ensure_ascii=False),
+    )
+
+
+def print_preview(events: list[dict[str, Any]], cfg: dict[str, Any], limit: int, as_json: bool) -> None:
+    fallback_host = socket.gethostname()
+    rows = [event_to_dict(e, fallback_host) for e in events]
+    rows.sort(key=lambda r: r["event_record_id"], reverse=True)
+    rows = rows[:limit]
+
+    print(
+        f"Found {len(events)} matching event(s) in the last {cfg['lookback_seconds']} seconds. "
+        f"Showing {len(rows)}. No PostgreSQL connection was used."
+    )
+
+    if as_json:
+        for row in rows:
+            print(json.dumps(row, ensure_ascii=False))
+        return
+
+    if not rows:
+        print("No matching file events found. Open a file inside an audited folder and run preview again.")
+        return
+
+    print("-" * 120)
+    print(f"{'Time UTC':19}  {'User':20}  {'Cat':7}  {'Process':28}  Path")
+    print("-" * 120)
+    for row in rows:
+        time_text = row["event_time"].replace("+00:00", "Z")[:19]
+        user = ((row["domain"] + "\\") if row["domain"] else "") + (row["username"] or "")
+        process = PureWindowsPath(row["process_name"] or "").name
+        print(f"{time_text:19}  {user[:20]:20}  {row['file_category'][:7]:7}  {process[:28]:28}  {row['path']}")
+
+
+def load_seen_keys_from_jsonl(path: Path) -> set[tuple[str, str, int]]:
+    seen: set[tuple[str, str, int]] = set()
+    if not path.exists():
+        return seen
+
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+                seen.add((str(row["host"]), str(row["source"]), int(row["event_record_id"])))
+            except Exception:
+                # Ignore malformed old/test lines.
+                continue
+    return seen
+
+
+def append_events_jsonl(events: Iterable[dict[str, Any]], output_path: str, seen: set[tuple[str, str, int]]) -> int:
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    fallback_host = socket.gethostname()
+    new_rows: list[dict[str, Any]] = []
+    for event in events:
+        key = event_key(event, fallback_host)
+        if key in seen:
+            continue
+        seen.add(key)
+        new_rows.append(event_to_dict(event, fallback_host))
+
+    if not new_rows:
+        return 0
+
+    with path.open("a", encoding="utf-8") as f:
+        for row in new_rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    return len(new_rows)
+
+
+def require_psycopg() -> Any:
+    if psycopg is None:
+        raise RuntimeError(
+            "PostgreSQL mode requires psycopg. Install it with: pip install -r requirements.txt\n"
+            "For no-database testing, use: python file_open_logger.py preview"
+        )
+    return psycopg
+
+
+def ensure_schema(conn: Any) -> None:
+    schema_path = os.path.join(os.path.dirname(__file__), "schema.sql")
+    with open(schema_path, "r", encoding="utf-8") as f:
+        conn.execute(f.read())
+    conn.commit()
+
+
+def insert_events(conn: Any, events: Iterable[dict[str, Any]]) -> int:
+    rows = [event_to_row(e, socket.gethostname()) for e in events]
+    if not rows:
+        return 0
+
+    sql = """
+        INSERT INTO file_open_events (
+            source, event_record_id, host, event_time, username, domain,
+            process_name, process_id, path, extension, file_category,
+            access_mask, access_list, raw_event
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+        ON CONFLICT (host, source, event_record_id) DO NOTHING
+    """
+    with conn.cursor() as cur:
+        cur.executemany(sql, rows)
+        inserted = cur.rowcount if cur.rowcount is not None else 0
+    conn.commit()
+    return max(inserted, 0)
+
+
+def read_and_filter(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    events = read_windows_events(cfg["lookback_seconds"])
+    return filter_events(events, cfg)
+
+
+def run_once_db(conn: Any, cfg: dict[str, Any]) -> tuple[int, int]:
+    kept = read_and_filter(cfg)
+    inserted = insert_events(conn, kept)
+    return len(kept), inserted
+
+
+def run_preview(cfg: dict[str, Any], limit: int, as_json: bool) -> int:
+    kept = read_and_filter(cfg)
+    print_preview(kept, cfg, limit, as_json)
+    return 0
+
+
+def run_watch_preview(cfg: dict[str, Any], limit: int, as_json: bool) -> int:
+    print(
+        f"OpenFilesLogger preview running without PostgreSQL. "
+        f"mode={cfg['mode']}, poll={cfg['poll_seconds']}s, lookback={cfg['lookback_seconds']}s"
+    )
+    seen: set[tuple[str, str, int]] = set()
+    fallback_host = socket.gethostname()
+    while True:
+        try:
+            kept = read_and_filter(cfg)
+            fresh = []
+            for event in kept:
+                key = event_key(event, fallback_host)
+                if key not in seen:
+                    seen.add(key)
+                    fresh.append(event)
+            if fresh:
+                print_preview(fresh, cfg, limit, as_json)
+        except KeyboardInterrupt:
+            print("Stopping.")
+            return 0
+        except Exception as exc:
+            print(f"Error: {exc}", file=sys.stderr, flush=True)
+        time.sleep(cfg["poll_seconds"])
+
+
+def run_log_local(cfg: dict[str, Any], output_path: str) -> int:
+    seen = load_seen_keys_from_jsonl(Path(output_path))
+    print(
+        f"OpenFilesLogger local JSONL logging running without PostgreSQL. "
+        f"output={output_path}, mode={cfg['mode']}, poll={cfg['poll_seconds']}s, lookback={cfg['lookback_seconds']}s"
+    )
+    while True:
+        try:
+            kept = read_and_filter(cfg)
+            written = append_events_jsonl(kept, output_path, seen)
+            if kept or written:
+                print(
+                    f"{datetime.now().isoformat(timespec='seconds')} kept={len(kept)} written={written} output={output_path}",
+                    flush=True,
+                )
+        except KeyboardInterrupt:
+            print("Stopping.")
+            return 0
+        except Exception as exc:
+            print(f"Error: {exc}", file=sys.stderr, flush=True)
+        time.sleep(cfg["poll_seconds"])
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Log Windows file-open/access audit events. Preview/local modes do not use PostgreSQL."
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="run",
+        choices=ALL_COMMANDS,
+        help="Use preview/dry-run/watch-preview/log-local for no-database testing. Use init-db/run-once/run for PostgreSQL.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum rows to print for preview/watch-preview. Default: FILE_LOGGER_PREVIEW_LIMIT or 50.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print preview output as JSON lines.",
+    )
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Output path for log-local. Default: FILE_LOGGER_LOCAL_OUTPUT or open_file_events.jsonl.",
+    )
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    cfg = get_config()
+    mode = cfg["mode"]
+    if mode not in {"documents", "all"}:
+        print("FILE_LOGGER_MODE must be 'documents' or 'all'.", file=sys.stderr)
+        return 2
+
+    command = "preview" if args.command == "dry-run" else args.command
+    limit = args.limit if args.limit is not None else cfg["preview_limit"]
+    output_path = args.output or cfg["local_output"]
+
+    if command == "preview":
+        return run_preview(cfg, limit, args.json)
+
+    if command == "watch-preview":
+        return run_watch_preview(cfg, limit, args.json)
+
+    if command == "log-local":
+        return run_log_local(cfg, output_path)
+
+    try:
+        pg = require_psycopg()
+        with pg.connect(cfg["dsn"]) as conn:
+            ensure_schema(conn)
+            if command == "init-db":
+                print("Database schema is ready.")
+                return 0
+            if command == "run-once":
+                kept, inserted = run_once_db(conn, cfg)
+                print(f"Kept {kept} file events; inserted {inserted} new rows.")
+                return 0
+
+            print(
+                f"OpenFilesLogger PostgreSQL logging running. "
+                f"mode={mode}, poll={cfg['poll_seconds']}s, lookback={cfg['lookback_seconds']}s"
+            )
+            while True:
+                try:
+                    kept, inserted = run_once_db(conn, cfg)
+                    if kept or inserted:
+                        print(
+                            f"{datetime.now().isoformat(timespec='seconds')} kept={kept} inserted={inserted}",
+                            flush=True,
+                        )
+                except KeyboardInterrupt:
+                    print("Stopping.")
+                    return 0
+                except Exception as exc:
+                    print(f"Error: {exc}", file=sys.stderr, flush=True)
+                time.sleep(cfg["poll_seconds"])
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
