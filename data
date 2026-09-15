@@ -1,0 +1,69 @@
+Engineering conclusion
+
+Yes—adding a central relief between two guide lands is the better design for hot-runner maintenance, provided that the relieved area is protected from PET ingress.
+
+For the original full-length close-fit design, any contact caused by thermal expansion, contamination, burrs, distortion or PET deposits can occur over the complete engagement length:
+
+$$ F_{\text{pull, full}}=\mu p\pi D L_T $$
+
+With the relieved design shown, only the front and rear guide lands are potential contact areas:
+
+$$ F_{\text{pull, relieved}} = \mu p\pi D(L_1+L_2) $$
+
+Therefore, the approximate ratio of frictional pull forces is:
+
+$$ \boxed{ \frac{F_{\text{relieved}}}{F_{\text{full}}} \approx \frac{L_1+L_2}{L_T} } $$
+
+and the theoretical reduction is:
+
+$$ \boxed{ \text{Force reduction} = \left[ 1-\frac{L_1+L_2}{L_T} \right]\times100\% } $$
+
+For example, if the original engagement length is 60 mm and the two guide lands total 20 mm:
+
+$$ \text{Reduction} = \left(1-\frac{20}{60}\right)\times100 \approx67\% $$
+
+This means the friction-related extraction force could be approximately one-third of the full-contact design, assuming the same contact pressure and friction coefficient.
+
+Fresh hot runner
+
+Because the insert is already 10 µm smaller than the hole diametrically, the ideal theoretical fit force is nearly zero when:
+
+Both components are at approximately the same temperature.
+The bore and insert are clean.
+There is no distortion or misalignment.
+No PET or other contamination is present.
+
+In the fresh condition, the relief may therefore not produce a large measurable reduction in ideal insertion force. Its main advantage is that it makes the design more tolerant of actual manufacturing and maintenance conditions.
+
+Only the two lands need to be accurately ground, inspected and cleaned. Minor deposits, thermal distortion or surface damage in the middle region will not directly contact the bore.
+
+Used hot runner
+
+The maintenance advantage becomes more important after service because the relief:
+
+Reduces the length over which PET residue can create friction.
+Reduces steel-to-steel rubbing and scoring.
+Reduces the possibility of galling during extraction.
+Limits polishing and dimensional restoration to two short guide lands.
+Provides better tolerance against small bore distortions.
+Makes it easier to break the insert free during maintenance.
+
+The two separated lands can still provide good radial and angular guidance, provided they are coaxial and have sufficient land length.
+
+Critical PET condition
+
+The conclusion is valid only when PET cannot enter and solidify inside the relieved annular area.
+
+If molten PET passes the first guide land and fills the relief, it may form a solid annular ring after cooling. That ring can act like a mechanical lock, potentially making the relieved insert more difficult to remove than a straight insert.
+
+OEM hot-runner maintenance guidance similarly emphasizes clean and burr-free fitting diameters, checking for interference instead of forcing components, relieving residual pressure, and minimizing molten-plastic entry into temporary internal voids.
+
+Therefore, the design should include:
+
+A sufficient sealing or guiding land between the melt-pressure region and the relief.
+No direct connection between the relief and the PET flow channel.
+A relief depth substantially greater than the 10 µm fit clearance, so normal deposits or thermal movement cannot bridge the relief.
+Smooth transitions or radii at the land-to-relief shoulders.
+Lead-in chamfers at both guiding lands.
+An extraction thread, puller groove or jacking arrangement for controlled removal.
+A defined maintenance procedure for depressurization and hot-versus-cold removal.
