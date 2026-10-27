@@ -1,68 +1,83 @@
-"""Copy this integration pattern into your existing application.
+"""Integration with the user's existing shared_var.shared_variable and Tk app.
 
-Your login code must populate shared_var before open_ot_window() is called.
-This file deliberately does not create or overwrite shared_var.py / pg_util.py.
+Do not run this as a separate app. Use add_ot_button() in the current app after
+login. Neither shared_var.py nor pg_util.py is replaced or recreated here.
 """
-import tkinter as tk
+from collections.abc import Callable, Sequence
 from tkinter import messagebox, ttk
 
-# import shared_var
+import shared_var
 from overtime_management import OvertimeWindow
 
+# Populate ONLY with exact role values that your own application authorizes for
+# OT approval. Intentionally empty: no unknown role receives approval rights.
+# For example, if your real OT-approver role is "OT_APPROVER", use:
+# OT_APPROVER_ROLES = frozenset({"OT_APPROVER"})
+OT_APPROVER_ROLES: frozenset[str] = frozenset()
 
-def add_ot_button(parent, *, can_approve_ot: bool = False, approval_departments=None):
-    """parent is an existing Tk/Toplevel/Frame. Rights come from trusted login code."""
+
+def can_current_user_approve_ot() -> bool:
+    """Replace with your existing trusted permission check when available."""
+    role = shared_var.shared_variable.role
+    return isinstance(role, str) and role in OT_APPROVER_ROLES
+
+
+def add_ot_button(
+    parent,
+    *,
+    permission_check: Callable[[], bool] = can_current_user_approve_ot,
+    approval_departments: Sequence[str] | None = None,
+):
+    """Return an unpacked button; permission is checked on every click.
+
+    None for approval_departments means the logged-in employee's department.
+    Keep your existing root/mainloop. Close OT windows on logout/role revocation.
+    This desktop-side check is not a substitute for server-side authorization.
+    """
     window = None
 
     def open_ot_window():
         nonlocal window
-        if window is not None and window.winfo_exists():
-            window.deiconify()
-            window.lift()
-            window.focus_set()
-            return
         try:
+            can_approve = permission_check()
+            if type(can_approve) is not bool:
+                raise ValueError("The OT permission check must return True or False.")
+            if window is not None and window.winfo_exists():
+                try:
+                    window.validate_session()
+                    if window.service.is_approver != can_approve:
+                        raise PermissionError("OT approval permission changed.")
+                except (ValueError, PermissionError):
+                    window.destroy()
+                    window = None
+                else:
+                    window.deiconify()
+                    window.lift()
+                    window.focus_set()
+                    return
             window = OvertimeWindow(
                 master=parent,
-                # shared_vars=shared_var,
-                field_map={
-                    "employee_id": "employee_id",  # Change to your actual ID attribute.
-                    "employee_name": "name",       # shared_var.name
-                    "department": "department",   # Change if yours is named differently.
-                },
-                is_approver=can_approve_ot,
-                # None defaults to the logged-in employee's department.
+                # Passing the MODULE lets session checks also notice replacement
+                # of shared_var.shared_variable during login/logout.
+                shared_vars=shared_var,
+                is_approver=can_approve,
                 approval_departments=approval_departments,
             )
-        except (ValueError, RuntimeError, ImportError) as exc:
+        except Exception as exc:
             messagebox.showerror("Cannot open Overtime Management", str(exc), parent=parent)
 
-    button = ttk.Button(parent, text="Overtime Management", command=open_ot_window)
-    return button
+    return ttk.Button(parent, text="Overtime Management", command=open_ot_window)
 
 
-# Inside your existing UI setup, after login:
+# Inside your EXISTING UI setup, after authenticated login:
+#
+# from example_integration import add_ot_button
 # button = add_ot_button(root)
 # button.pack(padx=10, pady=10)
 #
-# # When the authenticated user's existing permission system grants OT approval:
-# button = add_ot_button(root, can_approve_ot=permission_from_your_login_system,
+# Or supply your existing trusted permission callback:
+# button = add_ot_button(root, permission_check=your_ot_permission_check,
 #                        approval_departments=["Production", "Maintenance"])
 # button.pack()
-
-# Keep your application's existing root.mainloop(). Do not create a second root.
-# On logout or a role/permission change, close all OT windows and recreate the
-# integration for the new authenticated session.
-
-root = tk.Tk()
-window = OvertimeWindow(
-                master=root,
-                # shared_vars=shared_var,
-                field_map={
-                    "employee_id": "employee_id",  # Change to your actual ID attribute.
-                    "employee_name": "name",       # shared_var.name
-                    "department": "department",   # Change if yours is named differently.
-                },
-            )
-root.mainloop()
-
+#
+# Do not create SharedVariable() again. Reuse shared_var.shared_variable.

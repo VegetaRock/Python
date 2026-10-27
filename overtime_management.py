@@ -1,4 +1,4 @@
-"""Tkinter OT window using the host application's shared_var and pg_util.
+"""Tkinter OT window using shared_var.shared_variable and the existing pg_util.
 
 No login, Tk root, connection pool or employee master is created by this module.
 See README.md for integration and the trust boundary of a desktop database client.
@@ -22,13 +22,40 @@ MAX_OT_MINUTES = 16 * 60  # Application policy, not a statutory/legal limit.
 MAX_REASON_LENGTH = 1000
 HISTORY_LIMIT = 200
 
-# Only shared_var.name was specified. Adjust the other attribute names here,
-# or pass field_map=... when creating the window.
+# Exact attributes of the user's existing SharedVariable instance.
+# Do NOT create SharedVariable() here: that would create a second, empty session.
 SHARED_FIELD_MAP = {
-    "employee_id": "employee_id",
-    "employee_name": "name",
+    "employee_id": "user_emp_id",
+    "employee_name": "user_name",
     "department": "department",
 }
+
+
+def resolve_shared_source(source: Any = None) -> Any:
+    """Accept shared_var, its shared_variable instance, or an explicit mapping.
+
+    No shared-variable module is imported until the window/reader is used.
+    Keeping the module as the window's source also detects singleton replacement
+    on logout/login, in addition to edits to the existing singleton's attributes.
+    """
+    if source is None:
+        source = import_module("shared_var")
+    if isinstance(source, Mapping):
+        source = source.get("shared_variable", source)
+    else:
+        source = getattr(source, "shared_variable", source)
+    if source is None:
+        raise ValueError("shared_var.shared_variable is None. Complete login before opening OT.")
+    return source
+
+
+def read_shared_role(source: Any) -> str | None:
+    """Snapshot role for session-change detection; this does NOT grant approval."""
+    source = resolve_shared_source(source)
+    role = source.get("role") if isinstance(source, Mapping) else getattr(source, "role", None)
+    if isinstance(role, tk.Variable):
+        role = role.get()
+    return None if role is None else str(role)
 
 
 @dataclass(frozen=True)
@@ -40,6 +67,7 @@ class Employee:
     @classmethod
     def from_shared(cls, source: Any, field_map: Mapping[str, str] | None = None) -> "Employee":
         """Read plain values or Tkinter variables; call on the Tk/UI thread."""
+        source = resolve_shared_source(source)
         mapping = dict(SHARED_FIELD_MAP)
         if field_map:
             unknown = set(field_map) - set(mapping)
@@ -52,12 +80,12 @@ class Employee:
                 value = source[attribute] if isinstance(source, Mapping) else getattr(source, attribute)
             except (KeyError, AttributeError) as exc:
                 raise ValueError(
-                    f"shared_var.{attribute} is missing. Set it after login or change field_map."
+                    f"SharedVariable.{attribute} is missing. Set it after login or change field_map."
                 ) from exc
             if isinstance(value, tk.Variable):
                 value = value.get()
             if value is None or isinstance(value, bool) or not str(value).strip():
-                raise ValueError(f"shared_var.{attribute} must contain the logged-in employee's {field}.")
+                raise ValueError(f"SharedVariable.{attribute} must contain the logged-in employee's {field}. Complete login first.")
             values[field] = str(value).strip()
         return cls(**values)
 
@@ -326,10 +354,12 @@ class OvertimeWindow(tk.Toplevel):
         source = import_module("shared_var") if shared_vars is None else shared_vars
         employee = Employee.from_shared(source, field_map)
         service = OTService(employee, is_approver, approval_departments)
+        session_role = read_shared_role(source)
         super().__init__(master)
         self.shared_vars = source
         self.field_map = dict(field_map or {})
         self.employee = employee
+        self.session_role = session_role
         self.service = service
         self.server_day: date | None = None
         self.records: dict[int, Request] = {}
@@ -371,11 +401,20 @@ class OvertimeWindow(tk.Toplevel):
         self.content = ttk.Frame(self, padding=18, style="Overtime.TFrame")
         self.content.pack(side="left", fill="both", expand=True)
 
+    def validate_session(self) -> None:
+        """Reject an old window after identity/role changes in the host application.
+
+        This is a UI/session safeguard, not server-side authorization. The host
+        should close every OT window on logout or permission revocation.
+        """
+        if Employee.from_shared(self.shared_vars, self.field_map) != self.employee:
+            raise PermissionError("The logged-in employee changed. Close and reopen this OT window.")
+        if read_shared_role(self.shared_vars) != self.session_role:
+            raise PermissionError("Your role changed. Close and reopen this OT window.")
+
     def _guard(self, action: Callable[[], Any]):
         try:
-            # Changing users in the main app must not leave an old identity active here.
-            if Employee.from_shared(self.shared_vars, self.field_map) != self.employee:
-                raise PermissionError("The logged-in employee changed. Close and reopen this OT window.")
+            self.validate_session()
             return action()
         except (ValueError, PermissionError) as exc:
             messagebox.showwarning("Overtime Management", str(exc), parent=self)
@@ -406,7 +445,7 @@ class OvertimeWindow(tk.Toplevel):
         self.day_label.set(f"Business date: {day:%d %b %Y}  |  {BUSINESS_TIMEZONE}  |  Database time")
 
     def _identity_fields(self):
-        frame = ttk.LabelFrame(self.content, style="Overtime.TLabelframe", text="Employee details — from shared_var", padding=10)
+        frame = ttk.LabelFrame(self.content, style="Overtime.TLabelframe", text="Employee details — logged-in user", padding=10)
         frame.pack(fill="x", pady=(0, 12))
         self.identity_vars = []
         for col, (label, value) in enumerate((("Employee ID", self.employee.employee_id),

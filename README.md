@@ -1,23 +1,14 @@
-# Overtime Management — shared_var integration
+# Overtime Management — your SharedVariable integration
 
-A Tkinter `Toplevel` with the two-button Apply / Approve sidebar from the supplied
-layout. The host application owns login, `shared_var`, `pg_util`, the Tk root,
-and approval authorization. Python 3.10 or newer is required.
+A Tkinter Toplevel for the host application's existing authenticated session and
+PostgreSQL connection helper. The left sidebar contains Apply and Approve; the
+employee enters only OT start time, end time and reason.
 
-## What changed
+**Keep your existing `shared_var.py` and `pg_util.py` unchanged.** This package
+intentionally does not include replacement versions of them.
 
-Employee ID, name and department are read from your existing `shared_var`
-module/object when the OT window opens. They are displayed as **read-only**
-fields; employees enter only **start time, end time and reason**. Start and end
-are blank initially so the employee must deliberately enter the times.
-
-Only `shared_var.name` was explicitly specified. This version assumes the other
-attributes are `shared_var.employee_id` and `shared_var.department`; change the
-mapping below to match your actual variable names.
-
-Plain Python values and Tkinter variables (such as `tk.StringVar`) are supported.
-The helper reads `.get()` for Tkinter variables on the UI thread. No employee
-master table or separate login form is needed for this integration.
+This revision changes the Python integration only. There is no database schema
+change from the preceding shared-variable package.
 
 ## 1. Files and database setup
 
@@ -46,96 +37,127 @@ If your existing pg_util already works, no extra database package is required
 by this module. Install the driver your pg_util imports if it is not installed;
 for a psycopg2-based implementation, that can be `pip install psycopg2-binary`.
 
-## 2. Open it from your existing Tkinter application
+## 2. Exact mapping for your shared_var.py
 
-Your authenticated login process should already have populated the real values:
+Your module creates one existing instance:
 
 ```python
-# Illustrative attribute names, not a new login implementation:
-# shared_var.employee_id = the_authenticated_employee_id
-# shared_var.name = the_authenticated_employee_name
-# shared_var.department = the_authenticated_department
+shared_variable = SharedVariable()
 ```
+
+The application now reads:
+
+| Field | Existing value |
+| --- | --- |
+| Employee ID | `shared_var.shared_variable.user_emp_id` |
+| Employee name | `shared_var.shared_variable.user_name` |
+| Department | `shared_var.shared_variable.department` |
+| Role snapshot (session checks only) | `shared_var.shared_variable.role` |
+
+The fields `initial`, `theme`, `shift`, `holidays`, `lnk_path` and `path` are
+left untouched. No shift, holiday or theme rules are inferred from their names.
+Employee ID/name/department must be populated by your login process, not left at
+None. A useful error is shown if they are missing or empty.
+
+Open the window from your existing Tkinter application:
+
+```python
+from tkinter import messagebox
+from overtime_management import OvertimeWindow
+
+
+def open_ot_window():
+    try:
+        # Imports shared_var and uses its existing shared_variable automatically.
+        return OvertimeWindow(master=root)
+    except (ValueError, RuntimeError, ImportError) as exc:
+        messagebox.showerror("Cannot open OT", str(exc), parent=root)
+```
+
+Here `root` is your application's existing root/parent widget. In a Tkinter
+window class, use `master=self` when self is that widget. No second Tk root or
+mainloop is created by the OT module.
+
+Explicit module and instance forms are also supported:
 
 ```python
 import shared_var
-from overtime_management import OvertimeWindow
+window = OvertimeWindow(master=root, shared_vars=shared_var)
 
-# root is your EXISTING Tk root, Toplevel, or parent widget.
-window = OvertimeWindow(root, shared_vars=shared_var)
+# Alternative: passing the existing instance directly also works.
+from shared_var import shared_variable
+window = OvertimeWindow(master=root, shared_vars=shared_variable)
 ```
 
-Approval is disabled by default. No second `tk.Tk()` or `mainloop()` is created.
-You can also use `OvertimeWindow(root)` when `shared_var` is directly importable.
-See `example_integration.py` for a button handler that reuses the open OT window.
+Use only one of those forms at a time. The default/module form is preferred
+because it also notices when login code replaces the singleton itself. Never
+instantiate `SharedVariable()` in the OT code; that would create a separate,
+empty object instead of using the active login session.
 
-### Different shared-variable names
+Default field mapping (already configured in the downloaded Python file):
 
-For example, if you use `shared_var.emp_id`, `shared_var.name`, `shared_var.dept`:
+```python
+SHARED_FIELD_MAP = {
+    "employee_id": "user_emp_id",
+    "employee_name": "user_name",
+    "department": "department",
+}
+```
+
+The helper supports ordinary values and Tkinter variables. Employee identity is
+snapshotted when the window opens. Before UI operations it checks that the
+current employee and role have not changed. Close all OT windows on logout or
+permission revocation; create fresh ones after the next login. Role checks only
+notice the role value, not external permission changes that leave it unchanged.
+
+## 3. Approver access — do not guess your role values
+
+The actual values used by your `role` field were not supplied. Therefore a
+nonempty role, or a value such as "Admin", does NOT automatically enable
+approval. The default is `is_approver=False`.
+
+Pass a boolean from your existing trusted permission check:
 
 ```python
 window = OvertimeWindow(
-    root,
-    shared_vars=shared_var,
-    field_map={
-        "employee_id": "emp_id",
-        "employee_name": "name",
-        "department": "dept",
-    },
-)
-```
-
-The dictionary keys are fixed logical field names. The dictionary values are the
-attribute names in your shared_var module. You can instead change
-`SHARED_FIELD_MAP` once at the top of `overtime_management.py`.
-
-Employee identity is snapshotted at window creation, not taken from text fields
-when saving. The window checks for a changed shared identity before operations.
-Close OT windows on logout/user change; reopen them after a new login. Also close
-and reopen them when approval permissions change, because those are supplied by
-the host application at window creation.
-
-## 3. Approver access
-
-Do not infer approval rights from a person's name or department. Pass a real
-boolean from your authenticated application's existing permission check:
-
-```python
-window = OvertimeWindow(
-    root,
-    shared_vars=shared_var,
-    is_approver=can_approve_ot,  # bool returned by YOUR trusted permission logic
+    master=root,
+    is_approver=can_approve_ot,  # Actual bool from your authentication/permissions.
     approval_departments=["Production", "Maintenance"],
 )
 ```
 
-`can_approve_ot` is an integration placeholder, not an assumed shared_var field.
-When `is_approver=True` and `approval_departments` is omitted, approval is limited
-to the logged-in user's department. Specify an explicit department list for a
-cross-department approver. Department names must match stored strings exactly.
-An empty list gives no approval access. Self-approval is excluded in the queries.
-Do not set `is_approver=True` for every employee.
+When `is_approver=True` and `approval_departments` is omitted, the scope is the
+logged-in employee's department. Explicit department names must match stored
+strings. An empty list denies approval. Self-approval is excluded.
 
-This version uses **department-scoped** approval, not a reporting-manager
-hierarchy. No manager-to-employee mapping was provided. It does not invent one.
+`example_integration.py` includes a reusable button handler. Its
+`OT_APPROVER_ROLES` allowlist is deliberately empty. Populate it with the exact
+role strings your application authorizes for OT, or supply your own
+`permission_check` callback. Permission is rechecked whenever the button opens
+or reuses a window. Never use `bool(shared_variable.role)` as a permission check:
+it would grant approval to every nonempty role, including ordinary employees.
+
+This is department-scoped approval, not a reporting-manager hierarchy. No
+manager-to-employee mapping was provided.
 
 ### Security boundary
 
-Read-only widgets, shared_var values and a Python boolean are **not** independent
-proof of identity. This is an integration for a trusted authenticated host app.
-The service repeats role checks and adds ownership, department, date, status and
-optimistic-concurrency predicates to its SQL, but a modified desktop client with
-direct table-write credentials can bypass this Python service.
+Read-only fields, shared variables and a Python boolean are not independent
+proof of identity. This module is intended to integrate with a trusted
+authenticated host application. Service methods repeat checks and add employee,
+department, date, status and optimistic-concurrency predicates to their SQL,
+but a modified desktop client with direct table-write credentials could bypass
+that code.
 
-Before an adversarial/multi-user production deployment, authenticate users at a
-trusted backend, or use database-authenticated identities and properly restricted
-stored procedures/RLS. Do not expose unrestricted table-write credentials to
-untrusted clients. The schema here does not claim database-enforced identity,
-role authorization, audit immutability or protection from arbitrary direct SQL.
+For production with untrusted clients, enforce authentication and approval
+permissions through a trusted backend or database-authenticated identities with
+properly restricted stored procedures/RLS. Do not expose unrestricted table-write
+credentials. The included schema does not provide database-enforced identity,
+role authorization, immutable audits or protection from arbitrary direct SQL.
 
 ## 4. Employee workflow
 
-1. Open Apply. Employee details are filled from shared_var and are read-only.
+1. Open Apply. Employee details are filled from shared_var.shared_variable and are read-only.
 2. Enter start time and end time in 24-hour HH:MM format; enter a reason.
 3. Check the calculated duration and submit.
 4. Select today's Pending request to load it into the form, then Save changes
@@ -207,8 +229,9 @@ python -m unittest discover -s tests -v
 ```
 
 The included tests use fake cursors/connections, not your live PostgreSQL server.
-They test identity mapping, Tkinter variables, time validation, SQL safeguards,
-authorization gating and transaction cleanup. A GUI smoke check is also provided:
+They test exact field mapping, singleton resolution, identity/role changes,
+Tkinter variables, time validation, SQL safeguards, authorization gating and
+transaction cleanup. A GUI smoke check is also provided:
 
 ```text
 python tests/gui_smoke.py
