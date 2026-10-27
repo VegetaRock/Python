@@ -27,10 +27,13 @@ def add_ot_button(
     *,
     permission_check: Callable[[], bool] = can_current_user_approve_ot,
     approval_departments: Sequence[str] | None = None,
+    allow_self_approval: bool = False,
 ):
     """Return an unpacked button; permission is checked on every click.
 
     None for approval_departments means the logged-in employee's department.
+    Own OT is always visible to approvers. Set allow_self_approval=True only
+    when company policy permits own approval/rejection/approved-OT cancellation.
     Keep your existing root/mainloop. Close OT windows on logout/role revocation.
     This desktop-side check is not a substitute for server-side authorization.
     """
@@ -62,6 +65,7 @@ def add_ot_button(
                 shared_vars=shared_var,
                 is_approver=can_approve,
                 approval_departments=approval_departments,
+                allow_self_approval=allow_self_approval,
             )
         except Exception as exc:
             messagebox.showerror("Cannot open Overtime Management", str(exc), parent=parent)

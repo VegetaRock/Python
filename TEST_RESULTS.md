@@ -1,29 +1,34 @@
-# Validation of the SharedVariable integration update
+# Validation performed — v4
 
-## Executed successfully in this environment
+## Executed successfully
 
-- `python -m unittest discover -s tests -v`: 54 tests passed.
-- `xvfb-run -a python tests/gui_smoke.py`: passed on Tk 8.6 with mocked service responses.
-- `python -m compileall -q .`: passed.
-- `schema.sql` is byte-for-byte identical to the prior shared-variable package.
+- Python syntax compilation of the application, integration helper and tests.
+- **84 unittest tests passed**, with fake cursors/connections.
+- **GUI smoke test passed** under Xvfb with actual Tk widgets and mocked services.
+- Apply and Approve screenshots were captured and visually inspected.
 
-The unit tests cover exact user_emp_id/user_name/department mapping, existing
-shared_variable singleton resolution, module or instance input, identity and role
-changes, unpopulated login fields, Tk variables, time/reason validation,
-application-side authorization predicates and mocked transaction cleanup.
+The automated checks cover the shared singleton and field mapping, session/role
+changes, transaction lifecycle, query placeholders/parameters, SQL date/status/
+scope/concurrency predicates, status filtering before the history limit, own-row
+visibility, explicit self-action policy, approved cancellation and required
+reason, original-approval preservation, audit atomicity on a simulated failure,
+3 PM–11 PM boundaries, ten-minute increments and legacy-record handling.
 
-The GUI smoke test covers creation from the default shared_var import and a
-passed instance, three read-only employee fields, blank initial OT times,
-duration preview, submit/edit/cancel, approval, request details, employee/role
-changes and the disabled Approve button for an ordinary employee. Apply and
-Approve screenshots were generated and visually checked during this run.
+GUI checks exercise both sets of three dropdowns, fixed PM, hour 11 restricting
+minutes to 00, live duration, apply/approve filters, selection button states,
+submit/edit/pending-cancel/approved-cancel interactions, own visibility and default
+self-action restrictions, explicit self-action opt-in, employee access and the
+read-only employee identity fields. Previews contain synthetic demo data.
 
-## Not tested here
+## Not executed / limitations
 
-No connection was made to the user's PostgreSQL server. The real pg_util module,
-login/authentication system, permission model, network performance and Windows
-Tk installation were not available for integration testing. SQL tests use fake
-cursor responses; they are not live execution of SQL against PostgreSQL.
+No real PostgreSQL server or the user's actual pg_util implementation was
+available. The SQL migration/trigger has not been executed on a PostgreSQL
+instance. Unit tests inspect SQL and simulate results; they do not prove SQL
+execution, real row-lock concurrency, database privileges or timezone settings.
+Actual Windows DPI/theme rendering was not tested; GUI rendering was checked
+under Linux/Xvfb.
 
-Use a test database before deployment. This package does not claim server-side
-authorization or database-enforced audit immutability.
+Run the included scripts against a staging database and test actual permission,
+duplicate, concurrent update, cancellation rollback and midnight cases before
+production deployment. No production data was accessed or changed.

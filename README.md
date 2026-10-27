@@ -1,252 +1,282 @@
-# Overtime Management — your SharedVariable integration
+# Overtime Management v4 — Tkinter + PostgreSQL
 
-A Tkinter Toplevel for the host application's existing authenticated session and
-PostgreSQL connection helper. The left sidebar contains Apply and Approve; the
-employee enters only OT start time, end time and reason.
+A Toplevel that integrates with your existing Tkinter application, authenticated
+`shared_var.shared_variable`, and `pg_util` connection functions.
 
-**Keep your existing `shared_var.py` and `pg_util.py` unchanged.** This package
-intentionally does not include replacement versions of them.
+Keep your own `shared_var.py` and `pg_util.py` unchanged. Neither is replaced or
+included in this package. No second Tk root, login system or connection pool is
+created by the OT module.
 
-This revision changes the Python integration only. There is no database schema
-change from the preceding shared-variable package.
+## What's changed
 
-## 1. Files and database setup
-
-Copy `overtime_management.py` into an importable location beside your existing
-application. Keep using your own `shared_var.py` and `pg_util.py`; neither is
-bundled, so this project cannot overwrite your login data or database credentials.
-
-Run `schema.sql` in the same PostgreSQL database used by `pg_util`, using your
-normal schema-owner/migration account. If you already installed the previous
-version's schema, the same tables are compatible; the script also adds two
-lookup indexes. It uses `CREATE ... IF NOT EXISTS`, does not drop tables, and does
-not rewrite existing request data. This assumes the tables are those from the
-previous download; it is not a migration for unrelated tables with the same names.
-
-Use the same PostgreSQL schema/search_path for setup and application connections.
-The application needs SELECT/INSERT/UPDATE on `ot_requests`, SELECT/INSERT on
-`ot_audit`, and sequence permissions for the serial ID columns. Do not use a
-superuser or schema-owner account for ordinary runtime access.
-
-`pg_util.get_connection()` must return a psycopg2-compatible, **idle**, exclusively
-borrowed connection. `pg_util.release_connection(conn)` must return it to the
-pool or close it, and must discard broken connections as appropriate. A global
-connection simultaneously used by other operations is not suitable.
-
-If your existing pg_util already works, no extra database package is required
-by this module. Install the driver your pg_util imports if it is not installed;
-for a psycopg2-based implementation, that can be `pip install psycopg2-binary`.
-
-## 2. Exact mapping for your shared_var.py
-
-Your module creates one existing instance:
-
-```python
-shared_variable = SharedVariable()
-```
-
-The application now reads:
-
-| Field | Existing value |
+| Requirement | Implemented behavior |
 | --- | --- |
-| Employee ID | `shared_var.shared_variable.user_emp_id` |
-| Employee name | `shared_var.shared_variable.user_name` |
-| Department | `shared_var.shared_variable.department` |
-| Role snapshot (session checks only) | `shared_var.shared_variable.role` |
+| See your own OT in Approve | Today's own requests are included, highlighted and marked `(you)`. The selected status filter still applies. |
+| Cancel approved OT | A separate **Cancel approved OT** action is available only to an authorized approver for an unchanged Approved request for today in their scope. A reason is mandatory. |
+| Apply status filter | All, Pending, Approved, Cancelled, Rejected. Filtering happens in SQL before the 200-row history limit. |
+| Three time dropdowns | Each of Start and End has Hour / Minute / PM comboboxes. Hours 3–11; minutes 00, 10, 20, 30, 40, 50; PM fixed. |
+| Time window | 3:00 PM through 11:00 PM on the same day, end strictly after start. At hour 11 only minute 00 is offered. |
 
-The fields `initial`, `theme`, `shift`, `holidays`, `lnk_path` and `path` are
-left untouched. No shift, holiday or theme rules are inferred from their names.
-Employee ID/name/department must be populated by your login process, not left at
-None. A useful error is shown if they are missing or empty.
+**Interpretation of own requests:** visibility and permission are separate. Own
+requests are now visible to approvers. Self-approval remains disabled by default;
+set `allow_self_approval=True` explicitly when your policy permits an approver
+to approve, reject, or cancel their own approved OT. That option does not grant
+approver status and does not override department scope.
 
-Open the window from your existing Tkinter application:
+**Minute 60:** it is not a valid clock minute. Select the following hour with
+`00` instead: 3:60 PM becomes 4:00 PM. The form never silently rounds existing
+stored times, and it never offers 11:10–11:50 PM.
 
-```python
-from tkinter import messagebox
-from overtime_management import OvertimeWindow
+## Install / update
 
+Back up your application files and database using your usual deployment process.
+Replace the old `overtime_management.py` with the one in this package. Review
+`example_integration.py` when using its button handler.
 
-def open_ot_window():
-    try:
-        # Imports shared_var and uses its existing shared_variable automatically.
-        return OvertimeWindow(master=root)
-    except (ValueError, RuntimeError, ImportError) as exc:
-        messagebox.showerror("Cannot open OT", str(exc), parent=root)
-```
+### Existing OT database
 
-Here `root` is your application's existing root/parent widget. In a Tkinter
-window class, use `master=self` when self is that widget. No second Tk root or
-mainloop is created by the OT module.
+No new columns or tables are required. Cancellation details use the existing
+`ot_audit` table, so the new Python code is compatible with the preceding schema.
 
-Explicit module and instance forms are also supported:
+Run **migration_time_policy.sql** once in your application's database to enforce
+the new time window/increments in PostgreSQL as well. This is recommended for
+consistent behavior across older clients and direct writes. The Python service
+validates the same rules even before this optional database hardening is applied.
+
+Use your migration/schema-owner account and the same schema/search_path used by
+`pg_util`. The script is transactional and safe to rerun against the previous
+OT schema. It installs one function and trigger, does not delete/rewrite data,
+and aborts if its lock wait exceeds five seconds. Retry during a suitable
+maintenance window when a lock timeout occurs.
+
+### First installation
+
+Run **schema.sql** once. It creates the existing compatible tables/indexes and
+includes the time-policy trigger, so a separate migration run is unnecessary.
+The scripts assume these are the tables from this project, not unrelated tables
+with the same names.
+
+The retained legacy SQL duration CHECK permits up to 960 minutes so old records
+remain compatible. The new trigger limits new or time-edited requests and
+transitions into Approved to the requested window (maximum 480 minutes).
+
+### Legacy records
+
+Historical requests outside 3 PM–11 PM or not on a ten-minute boundary remain
+visible. The migration does not normalize or delete them. A same-day legacy
+Pending request must be edited into the new time policy before approval. It may
+still be rejected or cancelled; an already Approved legacy request may be
+cancelled by an authorized approver on its business date. Old dates stay
+read-only. Unsupported times are not silently loaded as different valid times
+into the new dropdowns; inspect the original time in the table or View details.
+
+## Exact existing shared-variable mapping
 
 ```python
 import shared_var
-window = OvertimeWindow(master=root, shared_vars=shared_var)
 
-# Alternative: passing the existing instance directly also works.
-from shared_var import shared_variable
-window = OvertimeWindow(master=root, shared_vars=shared_variable)
+employee_id = shared_var.shared_variable.user_emp_id
+employee_name = shared_var.shared_variable.user_name
+department = shared_var.shared_variable.department
+role = shared_var.shared_variable.role
 ```
 
-Use only one of those forms at a time. The default/module form is preferred
-because it also notices when login code replaces the singleton itself. Never
-instantiate `SharedVariable()` in the OT code; that would create a separate,
-empty object instead of using the active login session.
+The role is read for session-change detection only, not automatically interpreted
+as approval authority. Your actual role values were not supplied. Use your
+existing trusted permission check, or populate the explicit role allowlist in
+`example_integration.py` with the exact authorized values.
 
-Default field mapping (already configured in the downloaded Python file):
+The fields `initial`, `theme`, `shift`, `holidays`, `lnk_path` and `path` are left
+untouched. No extra work-calendar or payroll rules are inferred.
+
+## Open from your application
 
 ```python
-SHARED_FIELD_MAP = {
-    "employee_id": "user_emp_id",
-    "employee_name": "user_name",
-    "department": "department",
-}
+import shared_var
+from overtime_management import OvertimeWindow
+
+
+def open_ot_window(can_approve_ot: bool):
+    # root is your EXISTING Tkinter root/parent.
+    # can_approve_ot must come from your authenticated permission logic.
+    return OvertimeWindow(
+        master=root,
+        shared_vars=shared_var,
+        is_approver=can_approve_ot,
+        approval_departments=None,  # None = the logged-in user's department
+        allow_self_approval=False,
+    )
 ```
 
-The helper supports ordinary values and Tkinter variables. Employee identity is
-snapshotted when the window opens. Before UI operations it checks that the
-current employee and role have not changed. Close all OT windows on logout or
-permission revocation; create fresh ones after the next login. Role checks only
-notice the role value, not external permission changes that leave it unchanged.
+For employee access only, `OvertimeWindow(master=root)` automatically imports
+`shared_var` and resolves the existing `shared_variable` singleton. Passing the
+module is preferred over passing the instance because session checks can also
+notice when the host replaces the singleton at login/logout.
 
-## 3. Approver access — do not guess your role values
+Do not create another `SharedVariable()` in this module. Your login must fill
+`user_emp_id`, `user_name` and `department` before opening the OT window.
 
-The actual values used by your `role` field were not supplied. Therefore a
-nonempty role, or a value such as "Admin", does NOT automatically enable
-approval. The default is `is_approver=False`.
+For cross-department authority, pass an explicit list such as:
 
-Pass a boolean from your existing trusted permission check:
+```python
+approval_departments=["Production", "Maintenance"]
+```
+
+An empty list denies approval access. A string instead of a list is rejected.
+When the user is an approver, their own requests are visible even if their own
+department is outside that scope, but those requests remain read-only there.
+
+### Enable own approval explicitly
 
 ```python
 window = OvertimeWindow(
     master=root,
-    is_approver=can_approve_ot,  # Actual bool from your authentication/permissions.
-    approval_departments=["Production", "Maintenance"],
+    is_approver=can_approve_ot,  # trusted bool, not bool(shared_variable.role)
+    allow_self_approval=True,  # own approve/reject/approved-cancel allowed in scope
 )
 ```
 
-When `is_approver=True` and `approval_departments` is omitted, the scope is the
-logged-in employee's department. Explicit department names must match stored
-strings. An empty list denies approval. Self-approval is excluded.
+This is a host-configured business policy, not an employee-editable checkbox.
+`is_approver=False` always denies the Approve screen and service operations.
 
-`example_integration.py` includes a reusable button handler. Its
-`OT_APPROVER_ROLES` allowlist is deliberately empty. Populate it with the exact
-role strings your application authorizes for OT, or supply your own
-`permission_check` callback. Permission is rechecked whenever the button opens
-or reuses a window. Never use `bool(shared_variable.role)` as a permission check:
-it would grant approval to every nonempty role, including ordinary employees.
+### Reuse the same open window
 
-This is department-scoped approval, not a reporting-manager hierarchy. No
-manager-to-employee mapping was provided.
+The provided helper avoids duplicates and rechecks permission when reopening:
 
-### Security boundary
+```python
+from example_integration import add_ot_button
 
-Read-only fields, shared variables and a Python boolean are not independent
-proof of identity. This module is intended to integrate with a trusted
-authenticated host application. Service methods repeat checks and add employee,
-department, date, status and optimistic-concurrency predicates to their SQL,
-but a modified desktop client with direct table-write credentials could bypass
-that code.
+button = add_ot_button(
+    root,
+    permission_check=your_existing_ot_permission_check,
+    approval_departments=None,
+    allow_self_approval=False,
+)
+button.pack(padx=10, pady=10)
+```
 
-For production with untrusted clients, enforce authentication and approval
-permissions through a trusted backend or database-authenticated identities with
-properly restricted stored procedures/RLS. Do not expose unrestricted table-write
-credentials. The included schema does not provide database-enforced identity,
-role authorization, immutable audits or protection from arbitrary direct SQL.
+No second root or mainloop is needed. Close all OT windows on logout or permission
+revocation. Each guarded UI operation compares current identity and role to its
+opening snapshot. External permission changes that leave those values unchanged
+are not automatically detected by this desktop module.
 
-## 4. Employee workflow
+## Apply workflow
 
-1. Open Apply. Employee details are filled from shared_var.shared_variable and are read-only.
-2. Enter start time and end time in 24-hour HH:MM format; enter a reason.
-3. Check the calculated duration and submit.
-4. Select today's Pending request to load it into the form, then Save changes
-   or Cancel selected. Double-click or View details to read full reason,
-   approver remarks and audit entries.
+Employee ID, name and department are read-only. Choose a start/end time and enter
+a reason. Each time has three read-only comboboxes, e.g. `[3] [00] [PM]`.
+Hour starts blank and minute starts at 00; there is no silently assumed OT slot.
+Duration updates as selections change.
 
-There is no editable application-date field. Each submission and mutation checks
-the PostgreSQL server's business date, using `Asia/Kolkata`. A form kept open
-across midnight must be refreshed; it is not silently submitted for a new day.
-The date in the header is the last server date read, and mutations revalidate it.
-Refresh updates the header; it is not a continuously running clock.
+Use the status dropdown to show All / Pending / Approved / Cancelled / Rejected.
+The current filter persists through refresh and switching views. It is applied
+before the latest-200 matching-record limit. A newly saved request may be hidden
+by a filter that excludes its status; select All or Pending to see it.
 
-## 5. Approval workflow
+Select today's Pending request to edit or use **Cancel pending**. Save/cancel
+buttons are disabled on Approved, Rejected, Cancelled or historical requests.
+Employees cannot cancel Approved requests through the Apply screen, even when
+the same employee also has approver access; the separate approver operation is
+required. Double-click a row or use View details for full reason/history.
 
-Open Approve (authorized users only). The list shows today's requests within
-assigned departments, excluding the approver's own requests. Review full details,
-select a Pending request and approve or reject. Rejection requires a comment.
-The status filter can also show Approved, Rejected, Cancelled or All for today.
-Previously finalized requests cannot be changed by this interface.
+## Approval and approved-cancellation workflow
 
-The update includes the `updated_at` value from the loaded request. If an employee
-edits the request, or another approver decides it first, the action fails and the
-approver must refresh and review the updated request rather than approve stale
-information.
+Only authorized approvers can open Approve. The list includes today's requests
+in authorized departments plus the approver's own requests. Own rows are marked
+`(you)`; the status filter still applies. The default filter is Pending.
 
-## 6. Explicit policy choices
+Select a Pending row and approve or reject it. Rejection requires a comment.
+Own actions require `allow_self_approval=True` and normal department permission.
 
-- One request per employee per business date, including Cancelled and Rejected.
-  This preserves the previous schema's UNIQUE(employee_id, ot_date) rule.
-  Cancellation does NOT allow another request that day. Edit a Pending request
-  instead of cancelling it when changing the time or reason.
-- OT date is the START date. An end earlier than the start means the following
-  day; the UI shows `(+1d)` and asks for confirmation before submit/edit.
-  Example: today's 22:00 to tomorrow's 02:00 is four hours of today's OT.
-  It must be approved on its start date, before that business date ends.
-- Equal start/end times, invalid times, blank reasons and requests over 16 hours
-  are rejected. The 16-hour value is only a configurable application policy,
-  **not a legal or payroll rule**. Keep the Python limit and SQL CHECK consistent
-  if changing it; changing the Python constant alone does not alter an existing
-  database constraint.
-- Reasons and decision comments are limited to 1,000 characters in the app.
-- Only today's Pending request can be edited, cancelled, approved or rejected.
-  Old Pending requests remain Pending in history, but cannot be acted on; they
-  are not automatically relabelled Expired.
-- Employee history shows the latest 200 requests. Approval lists cover today.
-- Duration is elapsed wall-clock minutes; no breaks, payroll rates, attendance,
-  shift rules, holidays, minimum increments or legal entitlement are inferred.
-- Audit rows and the corresponding request changes are committed together. The
-  transaction is rolled back on failure; no hard-delete feature is provided.
+To cancel an Approved request, choose **Approved** or **All**, select the row,
+enter a cancellation reason, then click **Cancel approved OT** and confirm.
+Any authorized approver with the required department/self-action permission may
+perform this operation; it is not restricted to the original approving person.
 
-## 7. Connection handling and responsiveness
+The operation changes status to `Cancelled` and updates `updated_at`. It does
+not delete the row or overwrite `approver_id`, `approver_comment` or `decided_at`.
+An `ot_audit` record with action `CancelledApproved` stores the cancelling actor,
+server timestamp and reason. View details shows that record alongside the original
+approval. Request update and audit insertion share one transaction; a failure
+rolls both back.
 
-Connections are acquired and released through the two functions you specified.
-Autocommit is temporarily disabled and restored; transaction-local timezone,
-statement timeout (15 seconds) and lock timeout (5 seconds) are applied.
-The connect timeout itself must be configured in pg_util.
+The original `Cancelled` audit action continues to mean employee cancellation
+of a Pending request. Both kinds of cancellation appear in the Cancelled filter.
 
-Database work currently runs on the Tk/UI thread to stay compatible with an
-unknown existing connection pool. A slow connection/query can briefly block the
-interface. Do not move calls to workers without also using a thread-safe pool
-and dispatching all Tk operations back to the UI thread.
+## Retained business rules
 
-## 8. Tests
+One request per employee per business date, including Rejected and Cancelled,
+remains in force. Cancellation does NOT permit a second submission that day.
+Edit a Pending request instead of cancelling it to change its timing/reason.
 
-From this folder:
+All mutations are restricted to today's PostgreSQL business date in
+`Asia/Kolkata`, not the PC's date. The displayed date is the last server date
+read. An apply form left open across midnight must be refreshed before submitting.
+Overnight OT is no longer accepted. Historical rows are not automatically marked
+Expired; old Pending requests simply remain read-only Pending records.
+
+Approval, edits and both cancellation operations include the loaded `updated_at`
+value in the SQL condition. A request changed by another actor must be refreshed
+and reviewed again before action. The SQL also rechecks status, current business
+date, identity and department/self-action scope as appropriate.
+
+Reasons/comments/cancellation reasons are limited to 1,000 characters in the
+application. No payroll rates, attendance rules, shift deductions or statutory
+entitlements are calculated. The time window is your requested application
+policy, not a legal/payroll assertion.
+
+## Database connection handling and security
+
+```python
+conn = pg_util.get_connection()
+# Commit successful operations; roll back failed operations.
+pg_util.release_connection(conn)
+```
+
+Your provider must return an idle, exclusively borrowed, psycopg2-compatible
+connection. The module temporarily disables/restores autocommit and sets local
+timezone, 15-second statement timeout, and 5-second lock timeout. Configure the
+connection timeout and broken-connection disposal in your existing pg_util.
+
+Database calls remain on the UI thread for compatibility with an unknown existing
+pool. Slow connections/queries can temporarily pause the UI. Moving them to
+workers requires a thread-safe pool and main-thread Tk dispatch; that was not
+silently introduced in this revision.
+
+The runtime account needs the existing table/sequence permissions; don't use a
+superuser or migration-owner account for ordinary use. A shared variable,
+read-only widget and Python boolean are not a server-side identity boundary.
+The time-policy trigger validates time values, not who may approve/cancel.
+For untrusted desktop clients, enforce authentication and authorization in a
+trusted backend or restricted, database-authenticated procedures/RLS. Direct
+unrestricted SQL credentials can bypass the application's role, status and audit
+rules. This package does not claim immutable audit or database-enforced roles.
+
+## Tests and previews
+
+Python 3.10+ with working Tkinter is the intended runtime. Use the database driver
+already required by pg_util; the OT module does not create a new driver dependency.
 
 ```text
 python -m unittest discover -s tests -v
-```
-
-The included tests use fake cursors/connections, not your live PostgreSQL server.
-They test exact field mapping, singleton resolution, identity/role changes,
-Tkinter variables, time validation, SQL safeguards, authorization gating and
-transaction cleanup. A GUI smoke check is also provided:
-
-```text
 python tests/gui_smoke.py
 ```
 
-It uses demo in-memory service responses, opens/validates the GUI and exits. It
-does not connect to PostgreSQL or represent a production login.
+Linux headless GUI check:
 
-Before rollout, test with your actual pg_util and a test database: submit/edit,
-reject with/without comments, self-approval exclusion, department scope,
-permissions, duplicate submissions, midnight rollover and concurrent decisions.
-This package does not claim live PostgreSQL integration testing in your environment.
+```text
+xvfb-run -a python tests/gui_smoke.py
+```
+
+The tests use fake database connections/responses, not a real PostgreSQL server.
+The GUI smoke check uses demo records and tests widget interaction. Optional
+screenshots require Pillow and `OT_SCREENSHOT_DIR`. See TEST_RESULTS.md for
+what was actually tested. Test the migration and your real pg_util in a staging
+database before production rollout, including simultaneous actions and midnight
+rollover. The supplied SQL migration was not executed against your server.
 
 ## Reference documentation
 
-Python Tkinter: https://docs.python.org/3/library/tkinter.html
-PostgreSQL date/time functions: https://www.postgresql.org/docs/current/functions-datetime.html
-Psycopg connection transactions: https://www.psycopg.org/docs/connection.html
+- Python ttk Combobox: https://docs.python.org/3/library/tkinter.ttk.html#combobox
+- Python time minute range: https://docs.python.org/3/library/datetime.html#time-objects
+- PostgreSQL trigger behavior: https://www.postgresql.org/docs/current/sql-createtrigger.html
+- PostgreSQL date/time functions: https://www.postgresql.org/docs/current/functions-datetime.html
